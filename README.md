@@ -22,7 +22,7 @@ Installation
 Features
 --------
 
-* Full cell G0W0+DMFT and HF+DMFT (mixed MPI and OpenMP parallelization)
+* Full cell G<sub>0</sub>W<sub>0</sub>+DMFT and HF+DMFT (mixed MPI and OpenMP parallelization)
 
 * Hamiltonian-based impurity solvers
 	* Coupled-cluster Green's function
@@ -30,7 +30,7 @@ Features
 	* DMRG-MRCI Green's function (from block2)
 	* FCI/ED Green's function (from CheMPS2, for test only)
 
-* Molecular and periodic G0W0
+* Molecular and periodic G<sub>0</sub>W<sub>0</sub>
 
 * Molecular and periodic RPA
 
@@ -43,8 +43,8 @@ You can find Python scripts for running DMFT calculations in `/fcdmft/examples`.
 For example, in `/fcdmft/examples/Si`, the steps to run a full cell GW+DMFT
 calculations are:
 
-1. Perform DFT and G0W0 calculations by running `si_gw.py` 
-(Note: For large systems, G0W0 should be performed separately using multiple nodes, 
+1. Perform DFT and GW calculations by running `si_gw.py` 
+(Note: For large systems, GW should be performed separately using multiple nodes, 
 i.e. MPI, see `/fcdmft/examples/NiO`);
 
 2. Derive impurity Hamiltonian and GW double counting term by running `si_set_ham.py`;
