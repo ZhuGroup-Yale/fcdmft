@@ -1,7 +1,7 @@
 fcdmft
 ======
 
-Ab initio full cell DMFT and GW+DMFT package based on PySCF
+Ab initio full cell dynamical mean-field theory (DMFT) and GW+DMFT for solids based on PySCF
 
 Authors: Tianyu Zhu (tianyu.zhu@yale.edu), Huanchen Zhai, Zhihao Cui, Linqing Peng, Garnet Chan
 
