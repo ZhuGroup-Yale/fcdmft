@@ -41,7 +41,7 @@ QuickStart
 
 You can find Python scripts for running DMFT calculations in `/fcdmft/examples`.
 For example, in `/fcdmft/examples/Si`, the steps to run a full cell GW+DMFT
-calculations are:
+calculation are:
 
 1. Perform DFT and GW calculations by running `si_gw.py` 
 (Note: For large systems, GW should be performed separately using multiple nodes, 
@@ -50,7 +50,11 @@ i.e. MPI, see `/fcdmft/examples/NiO`);
 2. Derive impurity Hamiltonian and GW double counting term by running `si_set_ham.py`;
 
 3. Perform GW+DMFT calculation by running `run_dmft.py` (serial or MPI/OpenMP). 
-All DMFT parameters should be set in `run_dmft.py`.
+All DMFT parameters should be set in `run_dmft.py`. In this example, CCSD-GF is used
+as impurity solver. See `run_dmft` for sample Slurm submission script.
+
+4. (Optional) One may use a CAS-CI treatment when solving the impurity problem. See
+`CAS-CCSD/run_dmft.py` for setting CAS-related parameters.
 
 References
 ----------
