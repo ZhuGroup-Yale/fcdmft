@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --partition=smallmem,parallel
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH -c 28
+#SBATCH -t 05-00:00:00
+#SBATCH --mem=126000
+#SBATCH --output=nio_set_ham.out
+
+export SLURM_MPI_TYPE=pmi2
+export OMP_NUM_THREADS=28
+
+srun python -u nio_set_ham.py
+
