@@ -90,11 +90,34 @@ def kernel(gw, gfomega, mo_energy, mo_coeff, orbs=None,
     norbs = len(orbs)
     gw.orbs = orbs
 
+    if gw.load_sigma and os.path.isfile('vxc.h5') and os.path.isfile('sigma_imag.h5'):
+        fn = 'vxc.h5'
+        feri = h5py.File(fn, 'r')
+        vk = np.array(feri['vk'])
+        v_mf = np.array(feri['v_mf'])
+        feri.close()
+
+        fn = 'sigma_imag.h5'
+        feri = h5py.File(fn, 'r')
+        sigmaI = np.array(feri['sigmaI'])
+        omega = np.array(feri['omega'])
+        if gw.rdm:
+            sigmaI_full = np.array(feri['sigmaI_full'])
+        feri.close()
+
+        if gw.rdm:
+            gw.sigmaI = sigmaI_full
+    elif gw.load_sigma:
+        if rank == 0:
+            logger.warn(gw, 'No saved files, computing sigma ...')
+        gw.load_sigma = False
+
     # v_xc
-    dm = np.array(mf.make_rdm1())
-    v_mf = np.array(mf.get_veff()) - np.array(mf.get_j(dm_kpts=dm))
-    for k in range(nkpts):
-        v_mf[k] = reduce(numpy.dot, (mo_coeff[k].T.conj(), v_mf[k], mo_coeff[k]))
+    if not gw.load_sigma:
+        dm = np.array(mf.make_rdm1())
+        v_mf = np.array(mf.get_veff()) - np.array(mf.get_j(dm_kpts=dm))
+        for k in range(nkpts):
+            v_mf[k] = reduce(numpy.dot, (mo_coeff[k].T.conj(), v_mf[k], mo_coeff[k]))
 
     nocc = gw.nocc
     nmo = gw.nmo
@@ -102,15 +125,16 @@ def kernel(gw, gfomega, mo_energy, mo_coeff, orbs=None,
     mo_occ = gw.mo_occ
 
     # v_hf from DFT/HF density
-    dm = np.array(mf.make_rdm1())
-    rhf = scf.KRHF(gw.mol, gw.kpts, exxdiv=None)
-    if hasattr(gw._scf, 'sigma'):
-        rhf = scf.addons.smearing_(rhf, sigma=gw._scf.sigma, method="fermi")
-    rhf.with_df = gw.with_df
-    rhf.with_df._cderi = gw.with_df._cderi
-    vk = rhf.get_veff(gw.mol,dm_kpts=dm) - rhf.get_j(gw.mol,dm_kpts=dm)
-    for k in range(nkpts):
-        vk[k] = reduce(numpy.dot, (mo_coeff[k].T.conj(), vk[k], mo_coeff[k]))
+    if not gw.load_sigma:
+        dm = np.array(mf.make_rdm1())
+        rhf = scf.KRHF(gw.mol, gw.kpts, exxdiv=None)
+        if hasattr(gw._scf, 'sigma'):
+            rhf = scf.addons.smearing_(rhf, sigma=gw._scf.sigma, method="fermi")
+        rhf.with_df = gw.with_df
+        rhf.with_df._cderi = gw.with_df._cderi
+        vk = rhf.get_veff(gw.mol,dm_kpts=dm) - rhf.get_j(gw.mol,dm_kpts=dm)
+        for k in range(nkpts):
+            vk[k] = reduce(numpy.dot, (mo_coeff[k].T.conj(), vk[k], mo_coeff[k]))
 
     mo_occ_1d = np.array(mo_occ).reshape(-1)
     is_metal = False
@@ -131,9 +155,10 @@ def kernel(gw, gfomega, mo_energy, mo_coeff, orbs=None,
             if lumo > mo_energy[k][nocc]:
                 lumo = mo_energy[k][nocc]
         ef = (homo+lumo)/2.
+    gw.ef = ef
 
     # finite size correction for exchange self-energy
-    if gw.fc:
+    if gw.fc and (not gw.load_sigma):
         vk_corr = -2./np.pi * (6.*np.pi**2/gw.mol.vol/nkpts)**(1./3.)
         for k in range(nkpts):
             for i in range(nocc):
@@ -151,7 +176,8 @@ def kernel(gw, gfomega, mo_energy, mo_coeff, orbs=None,
     sigma = np.zeros((nkpts,nmo,nmo,nomega),dtype=np.complex128)
     if gw.fullsigma:
         # Compute full self-energy on imaginary axis i*[0,iw_cutoff]
-        sigmaI, omega = get_sigma_full(gw, orbs, kptlist, freqs, wts, iw_cutoff=5.)
+        if not gw.load_sigma:
+            sigmaI, omega = get_sigma_full(gw, orbs, kptlist, freqs, wts, iw_cutoff=5.)
 
         # Analytic continuation
         coeff = None; omega_fit = None
@@ -188,7 +214,8 @@ def kernel(gw, gfomega, mo_energy, mo_coeff, orbs=None,
                     sigma[kn,p,q] += vk[kn,p,q] - v_mf[kn,p,q]
     else:
         # Compute diagonal self-energy on imaginary axis i*[0,iw_cutoff]
-        sigmaI, omega = get_sigma_diag(gw, orbs, kptlist, freqs, wts, iw_cutoff=5.)
+        if not gw.load_sigma:
+            sigmaI, omega = get_sigma_diag(gw, orbs, kptlist, freqs, wts, iw_cutoff=5.)
 
         # Analytic continuation
         coeff = None; omega_fit = None
@@ -235,6 +262,8 @@ def kernel(gw, gfomega, mo_energy, mo_coeff, orbs=None,
             feri = h5py.File(fn, 'w')
             feri['sigmaI'] = np.asarray(sigmaI)
             feri['omega'] = np.asarray(omega)
+            if gw.sigmaI is not None:
+                feri['sigmaI_full'] = np.asarray(gw.sigmaI)
             feri.close()
 
             fn = 'ac_coeff.h5'
@@ -584,6 +613,7 @@ def make_rdm1_linear(gw):
     eta= 0.
     gf0 = get_g0_k(freqs, np.array(gw._scf.mo_energy)-gw.ef, eta)
     gf = np.zeros_like(gf0)
+    print (gf0.shape, gf.shape, sigma.shape, v_mf.shape)
     for k in range(nkpts):
         for iw in range(len(freqs)):
             gf[k,:,:,iw] = gf0[k,:,:,iw] + np.dot(gf0[k,:,:,iw], (vk[k] + sigma[k,:,:,iw] - v_mf[k])).dot(gf0[k,:,:,iw])
@@ -618,6 +648,7 @@ class KRGWGF(KRGWAC):
         self._keys = set(self.__dict__.keys()).union(keys)
         self.rdm = False
         self.sigmaI = None
+        self.load_sigma = False
 
     def dump_flags(self):
         log = logger.Logger(self.stdout, self.verbose)
