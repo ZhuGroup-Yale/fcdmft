@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "fcdmft"
+version = "0.0.1"
+authors = [
+  { name="Tianyu Zhu", email="tianyu.zhu@yale.edu" },
+  { name="Huanchen Zhai" },
+  { name="Zhihao Cui" },
+  { name="Linqing Peng" },
+  { name="Garnet Chan" }
+]
+description = "Ab initio full cell dynamical mean-field theory (DMFT) and GW+DMFT for solids based on PySCF"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+  'pyscf >= 1.7',
+  'libdmet'
+]
+
+[project.urls]
+"Homepage" = "https://github.com/ZhuGroup-Yale/fcdmft"
+"Bug Tracker" = "https://github.com/ZhuGroup-Yale/fcdmft/issues"
