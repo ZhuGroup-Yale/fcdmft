@@ -20,6 +20,7 @@ Installation
   cd fcdmft
   pip install .
   ```
+  If you prefer an editable installation, do `pip install -e .`
  
 Features
 --------
