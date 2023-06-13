@@ -365,7 +365,7 @@ def _get_ac_idx(nw, npts=18, step_ratio=2.0/3.0, idx_start=1):
     steps /= np.sum(steps)
     steps = np.cumsum(steps * nw) 
     steps += (idx_start - steps[0])
-    steps = np.round(steps).astype(np.int)
+    steps = np.round(steps).astype(int)
     return steps
 
 def AC_pade_thiele_diag(sigma, omega, npts=18, step_ratio=2.0/3.0):
