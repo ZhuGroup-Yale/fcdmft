@@ -14,11 +14,13 @@ Installation
 	- block2 (optional, by Huanchen Zhai, https://github.com/block-hczhai/block2-preview)
 	- CheMPS2 (optional)
 
-* You need to set environment variable `PYTHONPATH` to export fcdmft to Python. 
-  E.g. if fcdmft is installed in `/opt`, your `PYTHONPATH` should be
-
-        export PYTHONPATH=/opt/fcdmft:$PYTHONPATH
-
+* To install fcdmft in your Python environment:
+  ```
+  git clone -b main https://github.com/ZhuGroup-Yale/fcdmft.git
+  cd fcdmft
+  pip install .
+  ```
+ 
 Features
 --------
 
