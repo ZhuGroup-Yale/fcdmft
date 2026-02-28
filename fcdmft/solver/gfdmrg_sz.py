@@ -328,7 +328,7 @@ class GFDMRG:
                 if self.verbose >= 2:
                     _print("Using occupation number INIT MPS")
                 if self.idx is not None:
-                    occs = self.fcidump.reorder(VectorDouble(occs), VectorUInt16(self.idx))
+                    occs = self.fcidump.array_reorder(VectorDouble(occs), VectorUInt16(self.idx))
                 mps_info.set_bond_dimension_using_occ(
                     bond_dims[0], VectorDouble(occs), bias=bias)
             mps = MPS(self.n_sites, 0, 2)
@@ -447,6 +447,9 @@ class GFDMRG:
             else:
                 assert False
 
+        if self.mpi is not None:
+            self.mpi.barrier()
+
         mps.info.load_mutable()
         max_bdim = max([x.n_states_total for x in mps.info.left_dims])
         if mps.info.bond_dim < max_bdim:
@@ -547,6 +550,9 @@ class GFDMRG:
             else:
                 assert False
 
+        if self.mpi is not None:
+            self.mpi.barrier()
+
         mps.info.load_mutable()
         max_bdim = max([x.n_states_total for x in mps.info.left_dims])
         if mps.info.bond_dim < max_bdim:
@@ -611,6 +617,23 @@ class GFDMRG:
 
         return dm
 
+    def save_cps_mps(self, save_dir='./cps_mps'):
+        import shutil
+        import os
+        if self.mpi.rank == 0:
+            for k in os.listdir(self.scratch):
+                if '.DKET' in k or (k.startswith("DK") and k.endswith("_MPS_INFO")):
+                    shutil.copy(self.scratch + "/" + k, save_dir + "/" + k)
+        self.mpi.barrier()
+
+    def load_cps_mps(self, load_dir='./cps_mps'):
+        import shutil
+        import os
+        if self.mpi.rank == 0:
+            for k in os.listdir(load_dir):
+                shutil.copy(load_dir + "/" + k, self.scratch + "/" + k)
+        self.mpi.barrier()
+
     def save_gs_mps(self, save_dir='./gs_mps'):
         import shutil
         import pickle
@@ -637,7 +660,8 @@ class GFDMRG:
                         cps_bond_dims, cps_noises, cps_conv_tol, cps_n_steps, idxs,
                         eta, freqs, addition, extra_freqs=None, extra_eta=None,
                         cutoff=1E-14, diag_only=False,
-                        n_off_diag_cg=0, alpha=True, occs=None, bias=1.0, mo_coeff=None):
+                        n_off_diag_cg=0, alpha=True, occs=None, bias=1.0, mo_coeff=None,
+                        gf_mat_idxs=None, load_cps_mps=False):
         """Green's function."""
         ops = [None] * len(idxs)
         rkets = [None] * len(idxs)
@@ -736,7 +760,10 @@ class GFDMRG:
                 mo_coeff = mo_coeff[:, self.idx]
             gidxs = list(range(self.n_sites))
             ops = [None] * self.n_sites
-            print('idxs = ', idxs, 'gidxs = ', gidxs)
+            _print('idxs = ', idxs, 'gidxs = ', gidxs)
+
+        if gf_mat_idxs is None:
+            gf_mat_idxs = list(range(len(idxs)))
 
         for ii, idx in enumerate(gidxs):
             if SpinLabel == SZ:
@@ -757,6 +784,29 @@ class GFDMRG:
         for ii, idx in enumerate(idxs):
             if self.mpi is not None:
                 self.mpi.barrier()
+
+            if mo_coeff is None:
+                # the mpo and gf are in the same basis
+                # the mpo is SiteMPO
+                rmpos[ii] = SimplifiedMPO(
+                    SiteMPO(self.hamil, ops[ii]), NoTransposeRule(RuleQC()), True, True, OpNamesSet((OpNames.R, OpNames.RD)))
+            else:
+                # the mpo is in mo basis and gf is in ao basis
+                # the mpo is sum of SiteMPO (LocalMPO)
+                ao_ops = VectorOpElement([None] * self.n_sites)
+                for ix in range(self.n_sites):
+                    ao_ops[ix] = ops[ix] * mo_coeff[idx, ix]
+                rmpos[ii] = SimplifiedMPO(
+                    LocalMPO(self.hamil, ao_ops), NoTransposeRule(RuleQC()), True, True, OpNamesSet((OpNames.R, OpNames.RD)))
+
+            if self.mpi is not None:
+                rmpos[ii] = ParallelMPO(rmpos[ii], self.siterule)
+
+        for ii, idx in enumerate(idxs):
+            if self.mpi is not None:
+                self.mpi.barrier()
+            if load_cps_mps:
+                continue
             if self.verbose >= 2:
                 _print('>>> START Compression Site = %4d <<<' % idx)
             t = time.perf_counter()
@@ -780,7 +830,7 @@ class GFDMRG:
                                 self.hamil.vacuum, self.target + ops[ii].q_label, self.hamil.basis)
             else:
                 raise RuntimeError("Unsupported dyn corr method %s" % self.dyn_corr_method)
-            rket_info.tag = 'DKET%d' % idx
+            rket_info.tag = 'DKET%s%d' % ("A" if addition else "R", idx)
             rket_info.set_bond_dimension(mps.info.bond_dim)
             if occs is None:
                 if self.verbose >= 2:
@@ -801,24 +851,7 @@ class GFDMRG:
             rket_info.save_mutable()
             rket_info.deallocate_mutable()
             if self.mpi is None or self.mpi.rank == 0:
-                rket_info.save_data(self.scratch + "/DK%d_MPS_INFO" % ii)
-
-            if mo_coeff is None:
-                # the mpo and gf are in the same basis
-                # the mpo is SiteMPO
-                rmpos[ii] = SimplifiedMPO(
-                    SiteMPO(self.hamil, ops[ii]), NoTransposeRule(RuleQC()), True, True, OpNamesSet((OpNames.R, OpNames.RD)))
-            else:
-                # the mpo is in mo basis and gf is in ao basis
-                # the mpo is sum of SiteMPO (LocalMPO)
-                ao_ops = VectorOpElement([None] * self.n_sites)
-                for ix in range(self.n_sites):
-                    ao_ops[ix] = ops[ix] * mo_coeff[idx, ix]
-                rmpos[ii] = SimplifiedMPO(
-                    LocalMPO(self.hamil, ao_ops), NoTransposeRule(RuleQC()), True, True, OpNamesSet((OpNames.R, OpNames.RD)))
-
-            if self.mpi is not None:
-                rmpos[ii] = ParallelMPO(rmpos[ii], self.siterule)
+                rket_info.save_data(self.scratch + "/DK%s%d_MPS_INFO" % ("A" if addition else "R", ii))
 
             if len(cps_noises) == 1 and cps_noises[0] == 0:
                 pme = None
@@ -846,6 +879,34 @@ class GFDMRG:
                 _print('>>> COMPLETE Compression Site = %4d | Time = %.2f <<<' %
                        (idx, time.perf_counter() - t))
 
+        if load_cps_mps:
+
+            for ii, idx in enumerate(idxs):
+                if self.mpi is not None:
+                    self.mpi.barrier()
+                if self.verbose >= 2:
+                    _print('>>> START Loading Compression Site = %4d <<<' % idx)
+                t = time.perf_counter()
+
+                rket_info = MPSInfo(0)
+                rket_info.load_data(self.scratch + "/DK%s%d_MPS_INFO" % ("A" if addition else "R", ii))
+                rkets[ii] = MPS(rket_info)
+                rkets[ii].load_data()
+
+                rkets[ii].info.load_mutable()
+                max_bdim = max([x.n_states_total for x in rkets[ii].info.left_dims])
+                if rkets[ii].info.bond_dim < max_bdim:
+                    rkets[ii].info.bond_dim = max_bdim
+                max_bdim = max([x.n_states_total for x in rkets[ii].info.right_dims])
+                if rkets[ii].info.bond_dim < max_bdim:
+                    rkets[ii].info.bond_dim = max_bdim
+
+                rkets[ii].info.deallocate_mutable()
+
+                if self.verbose >= 2:
+                    _print('>>> COMPLETE Loading Compression Site = %4d | Time = %.2f <<<' %
+                        (idx, time.perf_counter() - t))
+
         gf_mat = np.zeros((len(idxs), len(idxs), len(freqs)), dtype=complex)
         if extra_freqs is None:
             extra_freqs = [[]] * len(freqs)
@@ -854,7 +915,12 @@ class GFDMRG:
         ex_gf_mats = [np.zeros((len(idxs), len(idxs), len(ex_fs)), dtype=complex)
             for ex_fs in extra_freqs]
 
+        dmain, dseco, imain, iseco = Global.frame.peak_used_memory
+
         for ii, idx in enumerate(idxs):
+
+            if ii not in gf_mat_idxs:
+                continue
 
             if rkets[ii].center != mps.center:
                 align_mps_center(rkets[ii], mps)
@@ -938,8 +1004,6 @@ class GFDMRG:
                                 if self.mpi is not None:
                                     self.mpi.barrier()
                                 rkets[jj].info.load_mutable()
-                                _print("EXT left  bond dim = ", ["%6d" % x.n_states_total for x in rkets[jj].info.left_dims])
-                                _print("EXT right bond dim = ", ["%6d" % x.n_states_total for x in rkets[jj].info.right_dims])
                                 rkets[jj].info.deallocate_mutable()
 
                             ext_mpss.append(rkets[jj])
@@ -1183,7 +1247,7 @@ def dmrg_mo_gf(mf, freqs, delta, ao_orbs=None, mo_orbs=None, gmres_tol=1E-7, add
                lowdin=False, diag_only=False, alpha=True, occs=None, bias=1.0, cutoff=1E-14,
                n_off_diag_cg=0, mpi=None, sample_det=None, do_2pdm=False,
                dyn_corr_method=None, ncore=0, nvirt=0, algo_type='auto', site_type=1,
-               dmain_ratio=0.4):
+               dmain_ratio=0.4, load_cps_dir=None, save_cps_dir=None, gf_mat_idxs=None):
     '''
     Calculate the DMRG GF matrix in the MO or AO basis.
 
@@ -1262,6 +1326,16 @@ def dmrg_mo_gf(mf, freqs, delta, ao_orbs=None, mo_orbs=None, gmres_tol=1E-7, add
         site_type: 0 or 1 (default) or 2, site type of sweep algorithm for one pdm / two pdm
             The smaller, the better memory and computational complexity
         dmain_ratio: the percentage of the main stack memory in block2
+        load_cps_dir : if not None, skip compression and load previous results
+        save_cps_dir : if not None, save results to a separate dir after compression calculation
+            Note: only one of load_cps_dir and save_cps_dir can be not None
+        gf_mat_idxs : list, if not None, only compute the gf matrix for the given list of indices
+            in particular, if k is in gf_mat_idxs,
+                gf[i, j] where (i == k and j >= k) or (j == k and i >= k) will be filled
+            if None (default), compute the full gf matrix.
+            if [] (empty list), and save_cps_dir is not None, this will only do the compression
+                and skip the green's function.
+            Skipped gf mat values will be filled with zero.
 
     Returns:
         gfmat : np.ndarray of dims (len(mo_orbs), len(mo_orbs), len(freqs)) (complex)
@@ -1269,6 +1343,7 @@ def dmrg_mo_gf(mf, freqs, delta, ao_orbs=None, mo_orbs=None, gmres_tol=1E-7, add
     '''
     from pyscf import lib, lo, symm, ao2mo
     assert ao_orbs is None or mo_orbs is None
+    assert load_cps_dir is None or save_cps_dir is None
 
     if mpi is not None:
         mpi = MPI
@@ -1412,24 +1487,34 @@ def dmrg_mo_gf(mf, freqs, delta, ao_orbs=None, mo_orbs=None, gmres_tol=1E-7, add
     if is_uhf:
         gf_beta = np.zeros((len(idxs), len(idxs), len(all_freqs)), dtype=complex)
 
+    if load_cps_dir is not None:
+        _print('loading compression mpss ...')
+        dmrg.load_cps_mps(load_cps_dir)
+
     for addit in [x == '+' for x in add_rem]:
         # only calculate alpha spin
         gf += dmrg.greens_function(gf_bond_dims, gf_noises, gmres_tol, gf_tol, gf_n_steps,
-                                       cps_bond_dims, cps_noises, cps_tol, cps_n_steps,
-                                       idxs=mo_orbs if ao_orbs is None else ao_orbs,
-                                       mo_coeff=None if ao_orbs is None or not mo_basis else (mo_coeff[0] if is_uhf else mo_coeff),
-                                       eta=delta, freqs=freqs, extra_freqs=extra_freqs, extra_eta=extra_delta,
-                                       addition=addit, diag_only=diag_only,  alpha=alpha, n_off_diag_cg=n_off_diag_cg)
+            cps_bond_dims, cps_noises, cps_tol, cps_n_steps,
+            idxs=mo_orbs if ao_orbs is None else ao_orbs,
+            mo_coeff=None if ao_orbs is None or not mo_basis else (mo_coeff[0] if is_uhf else mo_coeff),
+            eta=delta, freqs=freqs, extra_freqs=extra_freqs, extra_eta=extra_delta,
+            addition=addit, diag_only=diag_only,  alpha=alpha, n_off_diag_cg=n_off_diag_cg,
+            load_cps_mps=load_cps_dir is not None, gf_mat_idxs=gf_mat_idxs)
 
     if is_uhf:
         for addit in [x == '+' for x in add_rem]:
             # calculate beta spin
             gf_beta += dmrg.greens_function(gf_bond_dims, gf_noises, gmres_tol, gf_tol, gf_n_steps,
-                                                cps_bond_dims, cps_noises, cps_tol, cps_n_steps,
-                                                idxs=mo_orbs if ao_orbs is None else ao_orbs,
-                                                mo_coeff=None if ao_orbs is None or not mo_basis else (mo_coeff[1] if is_uhf else mo_coeff),
-                                                eta=delta, freqs=freqs, extra_freqs=extra_freqs, extra_eta=extra_delta,
-                                                addition=addit, diag_only=diag_only, alpha=False, n_off_diag_cg=n_off_diag_cg)
+                cps_bond_dims, cps_noises, cps_tol, cps_n_steps,
+                idxs=mo_orbs if ao_orbs is None else ao_orbs,
+                mo_coeff=None if ao_orbs is None or not mo_basis else (mo_coeff[1] if is_uhf else mo_coeff),
+                eta=delta, freqs=freqs, extra_freqs=extra_freqs, extra_eta=extra_delta,
+                addition=addit, diag_only=diag_only, alpha=False, n_off_diag_cg=n_off_diag_cg,
+                load_cps_mps=load_cps_dir is not None, gf_mat_idxs=gf_mat_idxs)
+
+    if save_cps_dir is not None:
+        _print('saving compression mpss ...')
+        dmrg.save_cps_mps(save_cps_dir)
 
     if is_uhf:
         gf = np.asarray((gf, gf_beta))
