@@ -43,7 +43,7 @@ def interpolate_mf(mf, kpts_band, return_fock=True, C_ao_lo=None, w90=None, wign
 
     # Computed Fock matrix in LO basis
     fock = veff + hcore
-    fock_lo = np.zeros((nkpts,nlo,nlo),dtype=np.complex)
+    fock_lo = np.zeros((nkpts,nlo,nlo),dtype=np.complex128)
     for k in range(nkpts):
         fock_lo[k] = np.dot(C_ao_lo[k].T.conj(), fock[k]).dot(C_ao_lo[k])
 
@@ -135,7 +135,7 @@ def interpolate_hf_diff(mf, kpts_band, fock_dft_band, mo_interpolate=False, mo_e
 
         # Compute Fock difference (HF-DFT) in LO basis
         dfock = veff_hf - veff
-        dfock_lo = np.zeros((nkpts,nlo,nlo),dtype=np.complex)
+        dfock_lo = np.zeros((nkpts,nlo,nlo),dtype=np.complex128)
         for k in range(nkpts):
             dfock_lo[k] = np.dot(C_ao_lo[k].T.conj(), dfock[k]).dot(C_ao_lo[k])
     else:
@@ -157,11 +157,11 @@ def interpolate_hf_diff(mf, kpts_band, fock_dft_band, mo_interpolate=False, mo_e
                 mo_energy_hf.append(e)
 
         # Compute Fock difference (HF-DFT) in LO basis
-        dfock_mo = np.zeros((nkpts,nao,nao),dtype=np.complex)
+        dfock_mo = np.zeros((nkpts,nao,nao),dtype=np.complex128)
         for k in range(nkpts):
             dfock_mo[k] = np.diag(mo_energy_hf[k] - mf.mo_energy[k])
         ovlp = np.array(mf.get_ovlp())
-        dfock_lo = np.zeros((nkpts,nlo,nlo),dtype=np.complex)
+        dfock_lo = np.zeros((nkpts,nlo,nlo),dtype=np.complex128)
         for k in range(nkpts):
             CSC = np.dot(C_ao_lo[k].T.conj(), ovlp[k]).dot(mf.mo_coeff[k])
             dfock_lo[k] = np.dot(CSC, dfock_mo[k]).dot(CSC.T.conj())
@@ -231,7 +231,7 @@ def interpolate_selfenergy(mf, kpts_band, sigma, C_ao_lo=None, w90=None, wigner_
 
     # Transform sigma from MO to LO basis
     nw = sigma.shape[-1]
-    sigma_lo = np.zeros((nkpts, nlo, nlo, nw), dtype=np.complex)
+    sigma_lo = np.zeros((nkpts, nlo, nlo, nw), dtype=np.complex128)
     ovlp = mf.get_ovlp()
     for k in range(nkpts):
         CSC = np.dot(C_ao_lo[k].T.conj(), ovlp[k]).dot(mf.mo_coeff[k])
