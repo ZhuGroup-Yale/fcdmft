@@ -74,3 +74,9 @@ Cite the following paper if GW code is used:
 Cite the following paper if libdmet package is used:
 
 * Z.-H. Cui, T. Zhu, and G. K.-L. Chan, J. Chem. Theory Comput. 16, 119-129 (2020)
+
+Funding
+-------
+
+The ongoing development of fcdmft and its integration with the PySCF quantum embedding infrastructure are supported in
+part by the National Science Foundation under Award No. OAC-2513473.
