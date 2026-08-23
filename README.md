@@ -78,5 +78,5 @@ Cite the following paper if libdmet package is used:
 Funding
 -------
 
-The ongoing development of fcdmft and its integration with the PySCF quantum embedding infrastructure are supported in
+The ongoing development of fcdmft and its integration with the PySCF infrastructure are supported in
 part by the National Science Foundation under Award No. OAC-2513473.
