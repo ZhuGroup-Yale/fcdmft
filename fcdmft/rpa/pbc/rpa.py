@@ -1,212 +1,337 @@
-#!/usr/bin/env python
-# Copyright 2014-2021 The PySCF Developers. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Author: Tianyu Zhu <zhutianyu1991@gmail.com>
-#
-
 """
-Periodic spin-restricted random phase approximation
-(direct RPA/dRPA in chemistry) with N^4 scaling (Gamma only)
+Periodic gamma-point spin-restricted random phase approximation (direct RPA) with N^4 scaling.
 
-Method:
-    Main routines are based on GW-AC method descirbed in:
+References:
     T. Zhu and G.K.-L. Chan, J. Chem. Theory. Comput. 17, 727-741 (2021)
-    X. Ren et al., New J. Phys. 14, 053020 (2012)
+    New J. Phys. 14, 053020 (2012)
 """
 
-import time, h5py, os
-from functools import reduce
 import numpy as np
+import os
 
-from pyscf import lib
-from pyscf.lib import logger
 from pyscf.ao2mo import _ao2mo
-from pyscf.pbc import df, dft, scf
-from pyscf.mp.mp2 import get_nocc, get_nmo, get_frozen_mask
-from pyscf import __config__
-from fcdmft.rpa.mol.rpa import RPA, get_rpa_ecorr, _get_scaled_legendre_roots, \
-                get_rho_response, _mo_energy_without_core, _mo_without_core
+from pyscf.lib import current_memory, temporary_env, einsum
+from pyscf.pbc import df, dft, scf, tools
 
-einsum = lib.einsum
+from fcdmft.rpa.mol.rpa import RPA, get_idx_metal, _mo_energy_without_core
 
-def kernel(rpa, mo_energy, mo_coeff, Lpq=None, nw=None, verbose=logger.NOTE):
-    """
-    RPA correlation and total energy
 
-    Args:
-        Lpq : density fitting 3-center integral in MO basis.
-        nw : number of frequency point on imaginary axis.
-        vhf_df : using density fitting integral to compute HF exchange.
+def get_rpa_exx(rpa, acfd=False, correction_only=False):
+    """Calculate periodic gamma-point RPA exchange energy."""
+    mo_energy = np.array(rpa._scf.mo_energy)
+    mo_coeff = np.array(rpa._scf.mo_coeff)
+    mo_occ = np.array(rpa._scf.mo_occ)
 
-    Returns:
-        e_tot : RPA total energy
-        e_hf : EXX energy
-        e_corr : RPA correlation energy
-    """
-    mf = rpa._scf
-    assert(rpa.frozen is None)
+    if getattr(rpa, 'with_df', None) is None:
+        rpa.initialize_df(auxbasis=rpa.auxbasis)
 
-    if Lpq is None:
-        Lpq = rpa.ao2mo(mo_coeff)
+    if not acfd and not correction_only:
+        dm = rpa._scf.make_rdm1()
+        with temporary_env(rpa.with_df, verbose=0), temporary_env(rpa.mol, verbose=0):
+            rhf = scf.RHF(rpa.mol, exxdiv=rpa._scf.exxdiv)
+            rhf.verbose = 0
+            if hasattr(rpa._scf, 'sigma'):
+                rhf = scf.addons.smearing_(rhf, sigma=rpa._scf.sigma, method=rpa._scf.smearing_method)
+            rhf.with_df = rpa._scf.with_df
+            vk = rhf.get_k(rhf.cell, dm)
+        return -0.25 * einsum('ij,ji', dm, vk)
 
-    # Grids for integration on imaginary axis
-    freqs, wts = _get_scaled_legendre_roots(nw)
+    if not hasattr(rpa._scf, 'sigma'):
+        return 0.0
 
-    # Compute HF exchange energy (EXX)
-    dm = mf.make_rdm1()
-    rhf = scf.RHF(rpa.mol, exxdiv=mf.exxdiv)
-    rhf.with_df = mf.with_df
-    rhf.with_df._cderi = mf.with_df._cderi
-    e_hf = rhf.energy_elec(dm=dm)[0]
-    e_hf += mf.energy_nuc()
+    idx_occ, idx_frac, _ = get_idx_metal(mo_occ)
+    nocc = len(idx_occ) + len(idx_frac)
+    Lij = rpa.loop_ao2mo(mo_coeff=mo_coeff, ijslice=(0, nocc, 0, nocc))
 
-    # Compute RPA correlation energy
-    e_corr = get_rpa_ecorr(rpa, Lpq, freqs, wts)
+    if acfd:
+        if correction_only:
+            mo_occ_ij = np.minimum(mo_occ[:nocc, None], mo_occ[None, :nocc]) / 2.0
+            mo_occ_ij -= mo_occ[:nocc, None] * mo_occ[None, :nocc] / 4.0
+        else:
+            eij = mo_energy[:nocc, None] - mo_energy[None, :nocc]
+            integrand = np.zeros((nocc, nocc), dtype=np.double)
+            integrand[eij > 1e-6] = 1
+            integrand[eij < -1e-6] = -1
+            mo_occ_ij = 1.0 - integrand
+            mo_occ_ij = mo_occ_ij * mo_occ[:nocc, None] / 2.0
+    else:
+        mo_occ_ij = mo_occ[:nocc, None] * mo_occ[None, :nocc] / 4.0
 
-    # Compute totol energy
-    e_tot = e_hf + e_corr
+    ex = -np.dot((Lij * mo_occ_ij[None]).ravel(), Lij.ravel())
 
-    logger.debug(rpa, '  RPA total energy = %s', e_tot)
-    logger.debug(rpa, '  EXX energy = %s, RPA corr energy = %s', e_hf, e_corr)
+    if rpa._scf.exxdiv == 'ewald' and rpa._scf.cell.dimension != 0:
+        madelung = tools.pbc.madelung(rpa._scf.cell, [np.zeros(3)])
+        ex -= 0.5 * madelung * np.sum(mo_occ**2)
+        if acfd:
+            f_i = mo_occ[:nocc]
+            ex -= 0.5 * madelung * np.sum(f_i - f_i * f_i)
 
-    return e_tot, e_hf, e_corr
+    return ex
 
 
 class RPA(RPA):
+    def get_ehf(self):
+        """Get Hartree-Fock energy.
 
-    @property
-    def nocc(self):
-        return self.get_nocc()
-    @nocc.setter
-    def nocc(self, n):
-        self._nocc = n
-
-    @property
-    def nmo(self):
-        return self.get_nmo()
-    @nmo.setter
-    def nmo(self, n):
-        self._nmo = n
-
-    get_nocc = get_nocc
-    get_nmo = get_nmo
-    get_frozen_mask = get_frozen_mask
-
-    def kernel(self, mo_energy=None, mo_coeff=None, Lpq=None, nw=40):
+        Returns
+        -------
+        e_hf : double
+            Hartree-Fock energy
         """
-        Args:
-            mo_energy : 1D array (nmo), mean-field mo energy
-            mo_coeff : 2D array (nmo, nmo), mean-field mo coefficient
-            Lpq : 3D array (naux, nmo, nmo), 3-index ERI
-            nw: interger, grid number
+        with temporary_env(self.with_df, verbose=0), temporary_env(self.mol, verbose=0):
+            dm = self._scf.make_rdm1()
+            rhf = scf.RHF(self.mol, exxdiv=self._scf.exxdiv)
+            rhf.verbose = 0
+            if hasattr(self._scf, 'sigma'):
+                rhf = scf.addons.smearing_(rhf, sigma=self._scf.sigma, method='fermi')
+            rhf.with_df = self._scf.with_df
+            with temporary_env(self.with_df, verbose=0), temporary_env(rhf.mol, verbose=0):
+                dm = self._scf.make_rdm1()
+                e_1e = einsum('ij,ji', dm, rhf.get_hcore())
+                e_j = 0.5 * einsum('ij,ji', dm, rhf.get_j(rhf.mol, dm))
+                e_x = self.get_rpa_exx(acfd=self.acfd_exx, correction_only=False)
+                e_nuc = self._scf.energy_nuc()
+                e_hf = e_1e + e_j + e_x + e_nuc
+        return e_hf
 
-        Returns:
-            self.e_tot : RPA total eenrgy
-            self.e_hf : EXX energy
-            self.e_corr : RPA correlation energy
+    def get_rpa_exx(self, acfd=False, correction_only=False):
+        """Calculate RPA exchange energy.
+
+        Parameters
+        ----------
+        acfd : bool
+            whether to include ACFD correction, by default False
+        correction_only : bool
+            only return the correction term, by default False
+
+        Returns
+        -------
+        ex : double
+            exchange energy
+        """
+        return get_rpa_exx(self, acfd=acfd, correction_only=correction_only)
+
+    def ao2mo(self, mo_coeff=None, mo_occ=None):
+        """Transform density-fitting integral from AO to MO.
+
+        Parameters
+        ----------
+        mo_coeff : double 1d array, optional
+            orbital energy, by default None
+        mo_occ : double 1d array, optional
+            occupation number, by default None
+
+        Returns
+        -------
+        eri_3d : double 3d array
+            three-center density-fitting matrix in MO
         """
         if mo_coeff is None:
-            mo_coeff = _mo_without_core(self, self._scf.mo_coeff)
-        if mo_energy is None:
-            mo_energy = _mo_energy_without_core(self, self._scf.mo_energy)
-
-        cput0 = (time.process_time(), time.perf_counter())
-        self.dump_flags()
-        self.e_tot, self.e_hf, self.e_corr = \
-                        kernel(self, mo_energy, mo_coeff, Lpq=Lpq, nw=nw, verbose=self.verbose)
-
-        logger.timer(self, 'RPA', *cput0)
-        return self.e_corr
-
-    def ao2mo(self, mo_coeff=None):
-        nmo = self.nmo
+            mo_coeff = self.mo_coeff
+        nmo = mo_coeff.shape[1]
         nao = self.mo_coeff.shape[0]
         naux = self.with_df.get_naoaux()
         kpts = self._scf.with_df.kpts
-        mem_incore = (2 * nmo**2*naux) * 8 /1e6
-        mem_now = lib.current_memory()[0]
+        max_memory = max(2000, self._scf.max_memory - current_memory()[0] - nao**2 * naux * 8 / 1e6)
+
+        is_metal = False
+        if mo_occ is None:
+            mo_occ_1d = _mo_energy_without_core(self, self._scf.mo_occ).reshape(-1)
+        else:
+            mo_occ_1d = np.array(mo_occ).reshape(-1)
+        if np.linalg.norm(np.abs(mo_occ_1d - 1.0) - 1.0) > 1e-5:
+            is_metal = True
 
         mo = np.asarray(mo_coeff, order='F')
-        ijslice = (0, nmo, 0, nmo)
-        Lpq = None
-
-        eri_3d_kpts = []
-        for i, kpti in enumerate(kpts):
-            eri_3d_kpts.append([])
-            for j, kptj in enumerate(kpts):
-                eri_3d = []
-                for LpqR, LpqI, sign in self._scf.with_df.sr_loop([kpti,kptj], max_memory=mem_now, compact=False):
-                    eri_3d.append(LpqR+LpqI*1j)
-                eri_3d = np.vstack(eri_3d).reshape(-1,nao,nao)
-                eri_3d_kpts[i].append(eri_3d)
-
-        if (mem_incore+mem_now < self.max_memory) or self.mol.incore_anyway:
-            tao = []
-            ao_loc = None
-            Lpq = _ao2mo.r_e2(np.array(eri_3d_kpts[0][0]), mo, ijslice, tao, ao_loc, out=Lpq)
-            return Lpq.real.reshape(naux,nmo,nmo)
+        if is_metal:
+            idx_occ, idx_frac, _ = get_idx_metal(mo_occ_1d)
+            nocc = len(idx_occ)
+            nfrac = len(idx_frac)
+            ijslice = (0, nocc + nfrac, nocc, nmo)
         else:
-            logger.warn(self, 'Memory not enough!')
-            raise NotImplementedError
+            idx_occ, idx_frac, _ = get_idx_metal(mo_occ_1d)
+            nocc = len(idx_occ)
+            ijslice = (0, nocc, nocc, nmo)
+        nislice = ijslice[1] - ijslice[0]
+        njslice = ijslice[3] - ijslice[2]
+
+        kptijkl = df.fft_ao2mo._format_kpts(kpts)
+        eri_3d = []
+        for LpqR, _, _ in self._scf.with_df.sr_loop(kptijkl[:2], max_memory=0.3 * max_memory, compact=False):
+            Lpq = None
+            Lpq = _ao2mo.nr_e2(LpqR.reshape(-1, nao, nao), mo, ijslice, aosym='s1', mosym='s1', out=Lpq)
+            eri_3d.append(Lpq)
+        eri_3d = np.vstack(eri_3d).reshape(-1, nislice, njslice)
+
+        return eri_3d
+
+    def loop_ao2mo(self, mo_coeff=None, ijslice=None):
+        """ransform density-fitting integral from AO to MO by block.
+
+        Parameters
+        ----------
+        mo_coeff : double 2d array, optional
+            coefficient from AO to MO, by default None
+        ijslice : tuple, optional
+            tuples for (1st idx start, 1st idx end, 2nd idx start, 2nd idx end), by default None
+
+        Returns
+        -------
+        eri_3d : double 3d array
+            three-center density-fitting matrix in MO in a block
+        """
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        nmo = mo_coeff.shape[1]
+        nao = self.mo_coeff.shape[0]
+        self.with_df.get_naoaux()
+        kpts = self._scf.with_df.kpts
+
+        is_metal = False
+        mo_occ_1d = np.array(self._scf.mo_occ).reshape(-1)
+        if np.linalg.norm(np.abs(mo_occ_1d - 1.0) - 1.0) > 1e-5:
+            is_metal = True
+
+        mo = np.asarray(mo_coeff, order='F')
+        if ijslice is None:
+            if is_metal:
+                # Assume the ordering of mo_coeff is
+                # occ, frac, vir
+                idx_occ, idx_frac, idx_vir = get_idx_metal(mo_occ_1d)
+                for i in idx_occ:
+                    assert i < idx_frac[0]
+                for i in idx_frac:
+                    assert i < idx_vir[0]
+                nocc = len(idx_occ)
+                nfrac = len(idx_frac)
+                ijslice = (0, nocc + nfrac, nocc, nmo)
+            else:
+                idx_occ, idx_frac, _ = get_idx_metal(mo_occ_1d)
+                nocc = len(idx_occ)
+                ijslice = (0, nocc, nocc, nmo)
+        nislice = ijslice[1] - ijslice[0]
+        njslice = ijslice[3] - ijslice[2]
+
+        kptijkl = df.fft_ao2mo._format_kpts(kpts)
+        eri_3d = []
+        for LpqR, _, _ in self._scf.with_df.sr_loop(
+            kptijkl[:2], max_memory=0.1 * self._scf.max_memory, compact=False
+        ):
+            Lpq = None
+            Lpq = _ao2mo.nr_e2(LpqR.reshape(-1, nao, nao), mo, ijslice, aosym='s1', mosym='s1', out=Lpq)
+            eri_3d.append(Lpq)
+        eri_3d = np.vstack(eri_3d).reshape(-1, nislice, njslice)
+
+        return eri_3d
+
 
 if __name__ == '__main__':
     from pyscf.pbc import gto, scf, dft, df, tools
     from pyscf.pbc.lib import chkfile
 
-    ucell = gto.Cell()
-    ucell.build(unit = 'angstrom',
-            a = '''
+    # test on diamond
+    ucell_test = gto.Cell()
+    ucell_test.build(
+        unit='angstrom',
+        a="""
                 0.000000     1.783500     1.783500
                 1.783500     0.000000     1.783500
                 1.783500     1.783500     0.000000
-            ''',
-            atom = 'C 1.337625 1.337625 1.337625; C 2.229375 2.229375 2.229375',
-            dimension = 3,
-            max_memory = 64000,
-            verbose = 5,
-            pseudo = 'gth-pbe',
-            basis='gth-dzv',
-            precision=1e-12)
+            """,
+        atom='C 1.337625 1.337625 1.337625; C 2.229375 2.229375 2.229375',
+        dimension=3,
+        max_memory=16000,
+        verbose=5,
+        pseudo='gth-pbe',
+        basis='gth-dzv',
+        precision=1e-12,
+    )
 
-    kmesh = [3,1,1]
-    cell = tools.super_cell(ucell, kmesh)
-    cell.verbose = 5
+    kmesh_test = [3, 1, 1]
+    cell_test = tools.super_cell(ucell_test, kmesh_test)
+    cell_test.verbose = 5
 
-    gdf = df.GDF(cell)
-    gdf_fname = 'gdf_ints.h5'
-    gdf._cderi_to_save = gdf_fname
-    if not os.path.isfile(gdf_fname):
-        gdf.build()
+    gdf_test = df.RSDF(cell_test)
+    gdf_fname_test = 'gdf_ints.h5'
+    gdf_test._cderi_to_save = gdf_fname_test
+    if not os.path.isfile(gdf_fname_test):
+        gdf_test.build()
 
-    chkfname = 'diamond_hf.chk'
-    if os.path.isfile(chkfname):
-        kmf = scf.RHF(cell).density_fit()
-        kmf.with_df = gdf
-        kmf.with_df._cderi = gdf_fname
-        kmf.conv_tol = 1e-12
-        data = chkfile.load(chkfname, 'scf')
-        kmf.__dict__.update(data)
+    chkfname_test = 'diamond_hf.chk'
+    if os.path.isfile(chkfname_test):
+        kmf_test = scf.RHF(cell_test).rs_density_fit()
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        kmf_test.conv_tol = 1e-12
+        data_test = chkfile.load(chkfname_test, 'scf')
+        kmf_test.__dict__.update(data_test)
     else:
-        kmf = scf.RHF(cell).density_fit()
-        kmf.with_df = gdf
-        kmf.with_df._cderi = gdf_fname
-        kmf.conv_tol = 1e-12
-        kmf.chkfile = chkfname
-        kmf.kernel()
+        kmf_test = scf.RHF(cell_test).rs_density_fit()
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        kmf_test.conv_tol = 1e-12
+        kmf_test.chkfile = chkfname_test
+        kmf_test.kernel()
 
-    rpa = RPA(kmf)
-    rpa.kernel()
-    assert(abs(rpa.e_corr- -0.5558316165999143) < 1e-6)
-    assert(abs(rpa.e_tot- -32.08317615664809) < 1e-6)
+    rpa_test = RPA(kmf_test)
+    rpa_test.kernel()
+    assert abs(rpa_test.e_corr - -0.5558316165999143) < 1e-6
+    assert abs(rpa_test.e_tot - -32.08317615664809) < 1e-6
+
+    # Test on Na (metallic)
+    ucell_test = gto.Cell()
+    ucell_test.build(
+        unit='angstrom',
+        a="""
+           -2.11250000000000   2.11250000000000   2.11250000000000
+           2.11250000000000  -2.11250000000000   2.11250000000000
+           2.11250000000000   2.11250000000000  -2.11250000000000
+           """,
+        atom="""
+           Na   0.00000   0.00000   0.00000
+           """,
+        dimension=3,
+        max_memory=16000,
+        verbose=5,
+        pseudo='gth-pade',
+        basis='gth-dzvp-molopt-sr',
+        precision=1e-10,
+    )
+
+    kmesh_test = [2, 2, 1]
+    cell_test = tools.super_cell(ucell_test, kmesh_test)
+    cell_test.verbose = 5
+
+    gdf_test = df.RSDF(cell_test)
+    gdf_fname_test = 'gdf_ints_na.h5'
+    gdf_test._cderi_to_save = gdf_fname_test
+    if not os.path.isfile(gdf_fname_test):
+        gdf_test.build()
+
+    chkfname_test = 'na_lda.chk'
+    if os.path.isfile(chkfname_test):
+        kmf_test = dft.RKS(cell_test).rs_density_fit()
+        kmf_test = scf.addons.smearing_(kmf_test, sigma=5e-3, method='fermi')
+        kmf_test.xc = 'lda'
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        kmf_test.conv_tol = 1e-12
+        data = chkfile.load(chkfname_test, 'scf')
+        kmf_test.__dict__.update(data)
+    else:
+        kmf_test = dft.RKS(cell_test).rs_density_fit()
+        kmf_test = scf.addons.smearing_(kmf_test, sigma=5e-3, method='fermi')
+        kmf_test.xc = 'lda'
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        kmf_test.conv_tol = 1e-12
+        kmf_test.chkfile = chkfname_test
+        kmf_test.kernel()
+
+    rpa_test = RPA(kmf_test)
+    rpa_test.kernel()
+
+    assert abs(rpa_test.e_corr - -0.1612718859071952) < 1e-6  # old value: -0.1612721103400592
+    assert abs(rpa_test.e_tot - -190.42773568569532) < 1e-6  # old value: -190.4277327357537
+
+    print('passed tests!')

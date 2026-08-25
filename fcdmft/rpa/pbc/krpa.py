@@ -1,48 +1,28 @@
-#!/usr/bin/env python
-# Copyright 2014-2021 The PySCF Developers. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Author: Tianyu Zhu <zhutianyu1991@gmail.com>
-#
+"""
+Periodic spin-restricted random phase approximation (direct RPA) with N^4 scaling.
 
-'''
-Periodic k-point spin-restricted random phase approximation
-(direct RPA/dRPA in chemistry) with N^4 scaling
-
-Method:
-    Main routines are based on GW-AC method descirbed in:
+References:
     T. Zhu and G.K.-L. Chan, J. Chem. Theory. Comput. 17, 727-741 (2021)
-    X. Ren et al., New J. Phys. 14, 053020 (2012)
-'''
+    New J. Phys. 14, 053020 (2012)
+"""
 
-from functools import reduce
-import time, h5py, os
-import numpy
 import numpy as np
-from scipy.optimize import newton, least_squares
+import scipy.linalg.blas as blas
+import time
 
 from pyscf import lib
-from pyscf.lib import logger
-from pyscf.ao2mo import _ao2mo
+from pyscf.lib import logger, temporary_env
+from pyscf.ao2mo._ao2mo import r_e2
 from pyscf.ao2mo.incore import _conc_mos
-from pyscf.pbc import df, dft, scf
+from pyscf.pbc import df, dft, scf, tools
 from pyscf.pbc.mp.kmp2 import get_nocc, get_nmo, get_frozen_mask
-from pyscf import __config__
 
-from fcdmft.gw.mol.gw_ac import _get_scaled_legendre_roots
-from fcdmft.gw.pbc.krgw_ac import get_rho_response, get_rho_response_metal, \
-                get_rho_response_head, get_rho_response_wing, get_qij
+from fcdmft.gw.minimax.minimax_rpa import get_frequency_minimax_grid
+from fcdmft.ac.grids import _get_scaled_legendre_roots
+from fcdmft.gw.pbc.krgw_ac import _mo_occ_frozen, _mo_energy_frozen, _mo_frozen, get_rho_response, \
+    get_rho_response_head, get_rho_response_wing, get_qij
+from fcdmft.rpa.pbc.rpa import get_idx_metal
+from fcdmft.utils.kpts import get_kconserv_ria_efficient
 from mpi4py import MPI
 
 rank = MPI.COMM_WORLD.Get_rank()
@@ -51,241 +31,769 @@ comm = MPI.COMM_WORLD
 
 einsum = lib.einsum
 
-def kernel(rpa, mo_energy, mo_coeff, nw=None, verbose=logger.NOTE):
+
+def kernel(rpa, mo_energy, nw=None, with_e_hf=None):
+    """RPA correlation and total energy
+
+    Parameters
+    ----------
+    rpa : KRPA
+        rpa object
+    mo_energy : double array
+        molecular orbital energies
+    Lpq : double array, optional
+        density fitting 3-center integral in MO basis, by default None
+    nw : int, optional
+        number of frequency point on imaginary axis, by default None
+    with_e_hf : float, optional
+        extra input HF energy, by default None
+
+    Returns
+    -------
+    e_tot : float
+        RPA total energy
+    e_hf : float
+        HF energy (exact exchange for given mo_coeff)
+    e_corr : float
+        RPA correlation energy
     """
-    RPA correlation and total energy
-
-    Returns:
-        e_tot : RPA total energy
-        e_hf : EXX energy
-        e_corr : RPA correlation energy
-    """
-    mf = rpa._scf
-    assert(rpa.frozen == 0)
-
-    nkpts = rpa.nkpts
-    nocc = rpa.nocc
-    nmo = rpa.nmo
-    nvir = nmo-nocc
-    mo_occ = rpa.mo_occ
-
     # Compute HF exchange energy (EXX)
-    dm = mf.make_rdm1()
-    rhf = scf.KRHF(rpa.mol, rpa.kpts, exxdiv=mf.exxdiv)
-    if hasattr(rpa._scf, 'sigma'):
-        rhf = scf.addons.smearing_(rhf, sigma=rpa._scf.sigma, method="fermi")
-    rhf.with_df = mf.with_df
-    rhf.with_df._cderi = mf.with_df._cderi
-    e_hf = rhf.energy_elec(dm)[0]
-    e_hf += mf.energy_nuc()
+    if with_e_hf is None:
+        rhf = scf.KRHF(rpa.mol, rpa.kpts, exxdiv=rpa._scf.exxdiv)
+        rhf.verbose = 0
+        if hasattr(rpa._scf, 'sigma'):
+            rhf = scf.addons.smearing_(rhf, sigma=rpa._scf.sigma, method=rpa._scf.smearing_method)
+        rhf.with_df = rpa._scf.with_df
+        with temporary_env(rpa.with_df, verbose=0), temporary_env(rhf.mol, verbose=0):
+            dm = rpa._scf.make_rdm1()
+            e_1e = 1.0 / len(rpa.kpts) * lib.einsum('kij,kji', dm, rhf.get_hcore()).real
+            e_j = 0.5 / len(rpa.kpts) * lib.einsum('kij,kji', dm, rhf.get_j(rhf.cell, dm)).real
+            e_x = get_rpa_exx(rpa, acfd=rpa.acfd_exx, correction_only=False)
+            e_nuc = rpa._scf.energy_nuc()
+            e_hf = e_1e + e_j + e_x + e_nuc
+    else:
+        e_hf = with_e_hf
+        if rank == 0 and rpa.verbose >= logger.DEBUG:
+            logger.debug(rpa, f'  Setting EXX energy explicitly to {e_hf}')
 
-    # check metal
-    mo_occ_1d = np.array(mo_occ).reshape(-1)
-    is_metal = False
-    if np.linalg.norm(np.abs(mo_occ_1d - 1.) - 1.) > 1e-5:
-        is_metal = True
-        if rpa.fc:
-            if rank == 0:
-                logger.warn(rpa, 'FC not available for metals - setting rpa.fc to False')
-            rpa.fc = False
+    is_metal = hasattr(rpa._scf, 'sigma')
+
+    # Turn off FC for metals and outcore
+    if is_metal and rpa.fc:
+        if rank == 0:
+            logger.warn(rpa, 'FC not available for metals - setting rpa.fc to False')
+        rpa.fc = False
+    if rpa.outcore and rpa.fc:
+        if rank == 0:
+            logger.warn(rpa, 'FC not available for outcore - setting rpa.fc to False')
+        rpa.fc = False
 
     # Grids for integration on imaginary axis
-    freqs,wts = _get_scaled_legendre_roots(nw)
+    freqs, wts = rpa.get_grids(nw=nw, mo_energy=mo_energy)
 
     # Compute RPA correlation energy
-    e_corr = get_rpa_ecorr(rpa, freqs, wts)
+    if rpa.outcore:
+        if is_metal:
+            e_corr = get_rpa_ecorr_outcore_metal(rpa, freqs, wts)
+        else:
+            e_corr = get_rpa_ecorr_outcore(rpa, freqs, wts)
+    else:
+        e_corr = get_rpa_ecorr(rpa, freqs, wts)
 
-    # Compute totol energy
+    # Compute total energy
     e_tot = e_hf + e_corr
 
     if rank == 0 and rpa.verbose >= logger.DEBUG:
-        logger.debug(rpa, '  RPA total energy = %s', e_tot)
-        logger.debug(rpa, '  EXX energy = %s, RPA corr energy = %s', e_hf, e_corr)
+        logger.debug(rpa, f'  RPA total energy = {e_tot}')
+        logger.debug(rpa, f'  EXX energy = {e_hf}, RPA corr energy = {e_corr}')
 
     return e_tot, e_hf, e_corr
 
-def get_rpa_ecorr(rpa, freqs, wts, max_memory=8000):
-    '''
-    Compute RPA correlation energy
-    '''
-    mo_energy = np.array(rpa._scf.mo_energy)
-    mo_coeff = np.array(rpa._scf.mo_coeff)
+
+def get_rho_response_metal(omega, mo_energy, mo_occ, Lpq, kidx):
+    """Get Pi=PV for metallic systems.
+    P is density-density response function.
+    V is two-electron integral.
+    See equation 24 in doi.org/10.1021/acs.jctc.0c00704.
+
+    NOTE: this function is different from the one in krgw_ac.py.
+    They should be merged in the future. The metal version here
+    is more efficient both in memory and computational time.
+
+    Parameters
+    ----------
+    omega : double
+        real position of imaginary frequency
+    mo_energy : double ndarray
+        orbital energy
+    mo_occ : double ndarray
+        occupation number
+    Lpq : list of complex ndarray
+        three-center density-fitting matrix in MO.
+        Lpq[ki] contains the naux x (nocc_i + nfrac_i) x (nfrac_i + nvir_i) sub-block.
+    kidx : list
+        momentum-conserved k-point list kj=kidx[ki]
+
+    Returns
+    -------
+    Pi : complex ndarray
+        Pi in auxiliary basis at freq iw
+    """
+    nkpts = len(Lpq)
+    naux = Lpq[0].shape[0]
+
+    # Compute Pi for kL
+    Pi = np.zeros(shape=[naux, naux], dtype=np.complex128)
+    for i in range(nkpts):
+        # Find ka that conserves with ki and kL (-ki+ka+kL=G)
+        a = kidx[i]
+        idx_occ_i, idx_frac_i, idx_vir_i = get_idx_metal(mo_occ[i])
+        idx_occ_a, idx_frac_a, idx_vir_a = get_idx_metal(mo_occ[a])
+
+        # merge index
+        idx_i = slice(idx_occ_i[0], idx_vir_i[0])
+        idx_a = slice(idx_occ_a[-1] + 1, idx_vir_a[-1] + 1)
+        nocc_i = len(idx_occ_i)
+        nfrac_a = len(idx_frac_a)
+
+        eia = mo_energy[i, idx_i, None] - mo_energy[a, None, idx_a]
+        fia = (mo_occ[i][idx_i, None] - mo_occ[a][None, idx_a]) / 2.0
+
+        # factor of 0.5 is for double counting
+        fia[nocc_i:, :nfrac_a] *= 0.5
+        # Response from both spin-up and spin-down density
+        rho_accum_inner(Pi, eia, omega, Lpq[i], alpha=4.0 / nkpts, fia=fia)
+
+    return Pi
+
+
+def rho_accum_inner(Pi, eia, omega, Lov, alpha=0.0, fia=None):
+    """Get contribution to response function from current occupied-virtual block.
+
+    Parameters
+    ----------
+    Pi : complex 2d array
+        density-density response function, will be overwritten
+    eia : double 2d array
+        occupied-virtual orbital energy difference
+    omega : double
+        real position of imaginary frequency
+    Lov : complex 3d array
+        occupied-virtual block of three-center density-fitting matrix in MO
+    alpha : float, optional
+        prefactor, by default 0.0
+    fia : double 2d array, optional
+        occupied-virtual occupation number difference, by default None
+    """
+    naux, nocc, nvir = Lov.shape
+    try:
+        import numexpr as ne
+
+        if fia is None:
+            eia = ne.evaluate('eia / (omega**2 + eia**2)')
+        else:
+            eia = ne.evaluate('eia * fia / (omega**2 + eia**2)')
+        Pia = ne.evaluate('Lov * eia').reshape(naux, nocc * nvir)
+    except ImportError:
+        # plain numpy, numexpr not available
+        if fia is None:
+            eia = eia / (omega**2 + eia**2)
+        else:
+            eia = eia * fia / (omega**2 + eia**2)
+        Pia = (Lov * eia).reshape(naux, nocc * nvir)
+
+    # The following call to blas.zgemm may be replaced with
+    # Pi += alpha * np.einsum('Pia, Qia -> PQ', Pia, Lov.conj(), optimize=True)
+    # with a moderate performance hit.
+
+    # zgemm is complex matrix multiplication. A wrapper is included in SciPy.
+    # C <- alpha * op(A) @ op(B) + beta * C
+    blas.zgemm(
+        alpha=alpha,
+        a=Lov.reshape(naux, nocc * nvir).T,
+        b=Pia.T,
+        trans_a=2,  # take conjugate transpose of A (this gives Lov.conj())
+        trans_b=0,  # B is Pia.T
+        beta=1.0,
+        c=Pi.T,  # Pi.T += alpha * Lov.conj() @ Pia.T
+        overwrite_c=True,
+    )
+
+    return
+
+
+def get_rpa_ecorr(rpa, freqs, wts):
+    """Compute RPA correlation energy.
+
+    Parameters
+    ----------
+    rpa : KRPA
+        rpa object
+    freqs : double 1d array
+            frequency grid
+        wts : double 1d array
+            weight of grids
+
+    Returns
+    -------
+    e_corr : double
+        correlation energy
+    """
+    mo_coeff = np.array(_mo_frozen(rpa, rpa._scf.mo_coeff))
+    mo_energy = np.array(_mo_energy_frozen(rpa, rpa._scf.mo_energy))
+    mo_occ = np.array(_mo_occ_frozen(rpa, rpa._scf.mo_occ))
+
     nocc = rpa.nocc
     nmo = rpa.nmo
+    nvir = nmo - nocc
+    nao = rpa._scf.mo_coeff[0].shape[0]
     nkpts = rpa.nkpts
     kpts = rpa.kpts
     nw = len(freqs)
     mydf = rpa.with_df
-    mo_occ = rpa.mo_occ
 
     # possible kpts shift center
     kscaled = rpa.mol.get_scaled_kpts(kpts)
     kscaled -= kscaled[0]
 
-    is_metal = False
-    mo_occ_1d = np.array(mo_occ).reshape(-1)
-    if np.linalg.norm(np.abs(mo_occ_1d - 1.) - 1.) > 1e-5:
-        is_metal = True
-        if rpa.fc:
-            if rank == 0:
-                logger.warn(rpa, 'FC not available for metals - setting rpa.fc to False')
-            rpa.fc = False
+    is_metal = hasattr(rpa._scf, 'sigma')
 
     segsize = nkpts // size
-    if rank >= size-(nkpts-segsize*size):
-        start = rank * segsize + rank-(size-(nkpts-segsize*size))
-        stop = min(nkpts, start+segsize+1)
+    if rank >= size - (nkpts - segsize * size):
+        start = rank * segsize + rank - (size - (nkpts - segsize * size))
+        stop = min(nkpts, start + segsize + 1)
     else:
         start = rank * segsize
-        stop = min(nkpts, start+segsize)
+        stop = min(nkpts, start + segsize)
 
     if rpa.fc:
-        # Set up q mesh for q->0 finite size correction
-        if not rpa.fc_grid:
-            q_pts = np.array([1e-3,0,0]).reshape(1,3)
-        else:
-            Nq = 4
-            q_pts = np.zeros((Nq**3-1,3))
-            for i in range(Nq):
-                for j in range(Nq):
-                    for k in range(Nq):
-                        if i == 0 and j == 0 and k== 0:
-                            continue
-                        else:
-                            q_pts[i*Nq**2+j*Nq+k-1,0] = k * 5e-4
-                            q_pts[i*Nq**2+j*Nq+k-1,1] = j * 5e-4
-                            q_pts[i*Nq**2+j*Nq+k-1,2] = i * 5e-4
-        nq_pts = len(q_pts)
-        q_abs = rpa.mol.get_abs_kpts(q_pts)
-
-        # Get qij = 1/sqrt(Omega) * < psi_{ik} | e^{iqr} | psi_{ak-q} > at q: (nkpts, nocc, nvir)
-        qij = np.zeros((nq_pts, nkpts, nocc, nmo - nocc),dtype=np.complex128)
-        for k in range(nq_pts):
-            qij[k] = get_qij(rpa, q_abs[k], mo_coeff)
+        qij, q_abs, nq_pts = rpa.get_q_mesh(mo_energy, mo_coeff)
 
     e_corr = 0j
-    for kL in range(start,stop):
+
+    # Precompute k-conservation table
+    # Given k-point indices (kL, i), kconserv_table[kshift,i] contains
+    # the index j that satisfies momentum conservation,
+    # (k(i) - k(j) - k(kL)) \dot a = 2n\pi
+    # i.e.
+    # - ki + kj + kL = G
+    kconserv_table = get_kconserv_ria_efficient(rpa.mol, kpts)
+    cderiarr = mydf.cderi_array()
+
+    for kL in range(start, stop):
         # Lij: (ki, L, i, j) for looping every kL
-        Lij = []
+        if is_metal:
+            Lij = []
+        else:
+            Lij = None
         # kidx: save kj that conserves with kL and ki (-ki+kj+kL=G)
         # kidx_r: save ki that conserves with kL and kj (-ki+kj+kL=G)
-        kidx = np.zeros((nkpts),dtype=np.int64)
-        kidx_r = np.zeros((nkpts),dtype=np.int64)
+        # kidx = np.zeros((nkpts),dtype=np.int64)
+        # kidx_r = np.zeros((nkpts),dtype=np.int64)
         for i, kpti in enumerate(kpts):
-            for j, kptj in enumerate(kpts):
+            j = kconserv_table[kL, i]
+            kptj = kpts[j]
+            kconserv = -kscaled[i] + kscaled[j] + kscaled[kL]
+            assert np.linalg.norm(np.round(kconserv) - kconserv) < 1e-12  # kidx[i] = j
+            # kidx_r[j] = i
+            logger.debug(rpa, f'Read Lpq (kL: {kL+1} / {nkpts}, ki: {i}, kj: {j} @ Rank {rank})')
+            # Read (L|pq) and ao2mo transform to (L|ij)
+            # support unequal naux on different k points
+            Lpq = cderiarr.load(kpti, kptj)
+            if Lpq.shape[-1] == (nao * (nao + 1)) // 2:
+                Lpq = lib.unpack_tril(Lpq).reshape(-1, nao**2)
+            else:
+                Lpq = Lpq.reshape(-1, nao**2)
+            Lpq = Lpq.astype(np.complex128)
+            tao = []
+            ao_loc = None
+            moij, ijslice = _conc_mos(mo_coeff[i], mo_coeff[j])[2:]
+
+            naux = Lpq.shape[0]
+            if not is_metal:
+                if Lij is None:
+                    Lij = np.zeros((nkpts, naux, nocc, nvir), dtype=np.complex128)
+                ijslice = (0, nocc, nmo + nocc, 2 * nmo)
+                r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij[i])
+            else:
+                # Only (nocc+nfrac, nfrac+nvir) block of Lpq is needed
+                # This is consistent with the new get_rho_response_metal implementation
+                idx_occ_i, idx_frac_i, idx_vir_i = get_idx_metal(mo_occ[i])
+                idx_occ_j, idx_frac_j, idx_vir_j = get_idx_metal(mo_occ[j])
+
+                nocc_i = len(idx_occ_i)
+                nfrac_i = len(idx_frac_i)
+                nocc_j = len(idx_occ_j)
+                nfrac_j = len(idx_frac_j)
+                nvir_j = len(idx_vir_j)
+                ijslice = (0, nocc_i + nfrac_i, nmo + nocc_j, 2 * nmo)
+
+                Lij.append(r_e2(Lpq, moij, ijslice, tao, ao_loc).reshape(naux, nocc_i + nfrac_i, nfrac_j + nvir_j))
+
+        for w in range(nw):
+            if is_metal:
+                Pi = get_rho_response_metal(freqs[w], mo_energy, mo_occ, Lij, kconserv_table[kL])
+            else:
+                Pi = get_rho_response(freqs[w], mo_energy, Lij, kconserv_table[kL])
+            if kL == 0 and rpa.fc:
+                for iq in range(nq_pts):
+                    # head Pi_00
+                    Pi_00 = get_rho_response_head(freqs[w], mo_energy, qij[iq])
+                    Pi_00 = 4.0 * np.pi / np.linalg.norm(q_abs[iq]) ** 2 * Pi_00
+                    # wings Pi_P0
+                    Pi_P0 = get_rho_response_wing(freqs[w], mo_energy, Lij, qij[iq])
+                    Pi_P0 = np.sqrt(4.0 * np.pi) / np.linalg.norm(q_abs[iq]) * Pi_P0
+
+                    # assemble Pi
+                    Pi_fc = np.zeros((naux + 1, naux + 1), dtype=Pi.dtype)
+                    Pi_fc[0, 0] = Pi_00
+                    Pi_fc[0, 1:] = Pi_P0.conj()
+                    Pi_fc[1:, 0] = Pi_P0
+                    Pi_fc[1:, 1:] = Pi
+
+                    e_corr += get_rpa_ecorr_w(Pi_fc, wts[w])
+            else:
+                e_corr += get_rpa_ecorr_w(Pi, wts[w])
+
+    e_corr = e_corr.real
+    e_corr = comm.allreduce(e_corr, op=MPI.SUM)
+    e_corr *= 1.0 / (2.0 * np.pi) / nkpts
+    return e_corr
+
+
+def get_rpa_ecorr_outcore(rpa, freqs, wts):
+    """Low-memory routine to compute RPA correlation energy.
+
+    Parameters
+    ----------
+    rpa : KRPA
+        rpa object
+    freqs : double 1d array
+        frequency grid
+    wts : double 1d array
+        weight of grids
+
+    Returns
+    -------
+    e_corr : double
+        correlation energy
+    """
+    mo_coeff = np.array(_mo_frozen(rpa, rpa._scf.mo_coeff))
+    mo_energy = np.array(_mo_energy_frozen(rpa, rpa._scf.mo_energy))
+
+    nocc = rpa.nocc
+    nmo = rpa.nmo
+    nao = rpa._scf.mo_coeff[0].shape[0]
+    nkpts = rpa.nkpts
+    kpts = rpa.kpts
+    nw = len(freqs)
+    mydf = rpa.with_df
+
+    # possible kpts shift center
+    kscaled = rpa.mol.get_scaled_kpts(kpts)
+    kscaled -= kscaled[0]
+
+    segsize = nkpts // size
+    if rank >= size - (nkpts - segsize * size):
+        start = rank * segsize + rank - (size - (nkpts - segsize * size))
+        stop = min(nkpts, start + segsize + 1)
+    else:
+        start = rank * segsize
+        stop = min(nkpts, start + segsize)
+
+    if rpa.fc:
+        qij, q_abs, nq_pts = rpa.get_q_mesh(mo_energy, mo_coeff)
+
+    e_corr = 0j
+
+    # Precompute k-conservation table
+    # Given k-point indices (kL, i), kconserv_table[kshift,i] contains
+    # the index j that satisfies momentum conservation,
+    # (k(i) - k(j) - k(kL)) \dot a = 2n\pi
+    # i.e.
+    # - ki + kj + kL = G
+    kconserv_table = get_kconserv_ria_efficient(rpa.mol, kpts)
+    cderiarr = mydf.cderi_array()
+
+    for kL in range(start, stop):
+        Pi = None
+        nseg = nocc // rpa.segsize + 1
+        for iseg in range(nseg):
+            orb_start = iseg * rpa.segsize
+            orb_end = min((iseg + 1) * rpa.segsize, nocc)
+            if orb_end == orb_start:
+                continue
+            norb_this_iter = orb_end - orb_start
+
+            # Lij: (ki, L, i, j) for looping every kL
+            # kidx: save kj that conserves with kL and ki (-ki+kj+kL=G)
+            # kidx_r: save ki that conserves with kL and kj (-ki+kj+kL=G)
+            # kidx = np.zeros((nkpts),dtype=np.int64)
+            # kidx_r = np.zeros((nkpts),dtype=np.int64)
+            for i, kpti in enumerate(kpts):
+                j = kconserv_table[kL, i]
+                kptj = kpts[j]
+                # Find (ki,kj) that satisfies momentum conservation with kL
+                kconserv = -kscaled[i] + kscaled[j] + kscaled[kL]
+                assert np.linalg.norm(np.round(kconserv) - kconserv) < 1e-12
+                logger.debug(rpa, f'Read Lpq (kL: {kL+1} / {nkpts}, ki: {i}, kj: {j} @ Rank {rank})')
+                # Read (L|pq) and ao2mo transform to (L|ij)
+                # support uneqaul naux on different k points
+                Lpq = cderiarr.load(kpti, kptj)
+                if Lpq.shape[-1] == (nao * (nao + 1)) // 2:
+                    Lpq = lib.unpack_tril(Lpq).reshape(-1, nao**2)
+                else:
+                    Lpq = Lpq.reshape(-1, nao**2)
+                Lpq = Lpq.astype(np.complex128)
+                naux = Lpq.shape[0]
+
+                tao = []
+                ao_loc = None
+                moij, ijslice = _conc_mos(mo_coeff[i], mo_coeff[j])[2:]
+
+                ijslice = (orb_start, orb_end, nmo + nocc, 2 * nmo)
+                Lij_slice = r_e2(Lpq, moij, ijslice, tao, ao_loc)
+                Lij_slice = Lij_slice.reshape(naux, norb_this_iter, nmo - nocc)
+                if Pi is None:
+                    Pi = np.zeros((nw, naux, naux), dtype=np.complex128)
+
+                # Find ka that conserves with ki and kL (-ki+ka+kL=G)
+                a_inner = kconserv_table[kL, i]
+                eia = mo_energy[i][orb_start:orb_end, None] - mo_energy[a_inner][None, nocc:]
+                for w in range(nw):
+                    rho_accum_inner(Pi[w], eia, freqs[w], Lij_slice, alpha=4.0 / nkpts)
+
+        for w in range(nw):
+            e_corr += get_rpa_ecorr_w(Pi[w], wts[w])
+
+    e_corr = e_corr.real
+    e_corr = comm.allreduce(e_corr, op=MPI.SUM)
+    e_corr *= 1.0 / (2.0 * np.pi) / nkpts
+    return e_corr
+
+
+def get_rpa_ecorr_outcore_metal(rpa, freqs, wts):
+    """Low-memory routine to compute RPA correlation energy for metals.
+
+    Parameters
+    ----------
+    rpa : KRPA
+        rpa object
+    freqs : double 1d array
+        frequency grid
+    wts : double 1d array
+        weight of grids
+
+    Returns
+    -------
+    e_corr : double
+        correlation energy
+    """
+    mo_coeff = np.array(_mo_frozen(rpa, rpa._scf.mo_coeff))
+    mo_energy = np.array(_mo_energy_frozen(rpa, rpa._scf.mo_energy))
+    mo_occ = np.array(_mo_occ_frozen(rpa, rpa._scf.mo_occ))
+
+    nmo = rpa.nmo
+    nao = rpa._scf.mo_coeff[0].shape[0]
+    nkpts = rpa.nkpts
+    kpts = rpa.kpts
+    nw = len(freqs)
+    mydf = rpa.with_df
+
+    # possible kpts shift center
+    kscaled = rpa.mol.get_scaled_kpts(kpts)
+    kscaled -= kscaled[0]
+
+    segsize = nkpts // size
+    if rank >= size - (nkpts - segsize * size):
+        start = rank * segsize + rank - (size - (nkpts - segsize * size))
+        stop = min(nkpts, start + segsize + 1)
+    else:
+        start = rank * segsize
+        stop = min(nkpts, start + segsize)
+
+    e_corr = 0j
+
+    # Precompute k-conservation table
+    # Given k-point indices (kL, i), kconserv_table[kshift,i] contains
+    # the index j that satisfies momentum conservation,
+    # (k(i) - k(j) - k(kL)) \dot a = 2n\pi
+    # i.e.
+    # - ki + kj + kL = G
+    kconserv_table = get_kconserv_ria_efficient(rpa.mol, kpts)
+    cderiarr = mydf.cderi_array()
+
+    for kL in range(start, stop):
+        Pi = None
+        # Lij: (ki, L, i, j) for looping every kL
+        # kidx: save kj that conserves with kL and ki (-ki+kj+kL=G)
+        # kidx_r: save ki that conserves with kL and kj (-ki+kj+kL=G)
+        # kidx = np.zeros((nkpts),dtype=np.int64)
+        # kidx_r = np.zeros((nkpts),dtype=np.int64)
+        for i, kpti in enumerate(kpts):
+            j = kconserv_table[kL, i]
+            kptj = kpts[j]
+            # Find (ki,kj) that satisfies momentum conservation with kL
+            kconserv = -kscaled[i] + kscaled[j] + kscaled[kL]
+            assert np.linalg.norm(np.round(kconserv) - kconserv) < 1e-12
+            logger.debug(rpa, f'Read Lpq (kL: {kL+1} / {nkpts}, ki: {i}, kj: {j} @ Rank {rank})')
+            # Read (L|pq) and ao2mo transform to (L|ij)
+            # support uneqaul naux on different k points
+            Lpq = cderiarr.load(kpti, kptj)
+            if Lpq.shape[-1] == (nao * (nao + 1)) // 2:
+                Lpq = lib.unpack_tril(Lpq).reshape(-1, nao**2)
+            else:
+                Lpq = Lpq.reshape(-1, nao**2)
+            Lpq = Lpq.astype(np.complex128)
+            naux = Lpq.shape[0]
+
+            idx_occ_i, idx_frac_i, idx_vir_i = get_idx_metal(mo_occ[i])
+            idx_occ_j, idx_frac_j, idx_vir_j = get_idx_metal(mo_occ[j])
+
+            nocc_i = len(idx_occ_i)
+            nfrac_i = len(idx_frac_i)
+            nocc_j = len(idx_occ_j)
+            nfrac_j = len(idx_frac_j)
+            nseg = (nocc_i + nfrac_i) // rpa.segsize + 1
+            for iseg in range(nseg):
+                orb_start = iseg * rpa.segsize
+                orb_end = min((iseg + 1) * rpa.segsize, nocc_i + nfrac_i)
+                if orb_end == orb_start:
+                    break
+                norb_this_iter = orb_end - orb_start
+
+                tao = []
+                ao_loc = None
+                moij, ijslice = _conc_mos(mo_coeff[i], mo_coeff[j])[2:]
+
+                ijslice = (orb_start, orb_end, nmo + nocc_j, 2 * nmo)
+                Lij_slice = r_e2(Lpq, moij, ijslice, tao, ao_loc)
+                Lij_slice = Lij_slice.reshape(naux, norb_this_iter, nmo - nocc_j)
+                if Pi is None:
+                    Pi = np.zeros((nw, naux, naux), dtype=np.complex128)
+
+                # Find ka that conserves with ki and kL (-ki+ka+kL=G)
+                eia = mo_energy[i][orb_start:orb_end, None] - mo_energy[j][None, nocc_j:]
+                fia = (mo_occ[i][orb_start:orb_end, None] - mo_occ[j][None, nocc_j:]) / 2.0
+                # The overall fia[nocc_i:, :nfrac_j] *= 0.5 for double counting
+                if orb_start >= nocc_i:
+                    fia[:, :nfrac_j] *= 0.5
+                elif orb_end > nocc_i:
+                    offset = nocc_i - orb_start
+                    fia[offset:, :nfrac_j] *= 0.5
+                for w in range(nw):
+                    rho_accum_inner(Pi[w], eia, freqs[w], Lij_slice, alpha=4.0 / nkpts, fia=fia)
+
+        for w in range(nw):
+            e_corr += get_rpa_ecorr_w(Pi[w], wts[w])
+
+    e_corr = e_corr.real
+    e_corr = comm.allreduce(e_corr, op=MPI.SUM)
+    e_corr *= 1.0 / (2.0 * np.pi) / nkpts
+    return e_corr
+
+
+def get_rpa_ecorr_w(Pi_w, wts_w):
+    """Get contribution to RPA correlation energy from a single frequency.
+
+    Parameters
+    ----------
+    Pi_w : complex 2d array
+        density-density response function at a single frequency
+    wts_w : double
+        weights of the frequency
+
+    Returns
+    -------
+    e_corr : double
+        correlation energy
+    """
+    # First, compute ec_w = Tr(Pi_w) + |log(det(I-Pi_w))|
+    ec_w = np.trace(Pi_w)
+    # The following two lines are equivalent to
+    # Pi_w = np.eye(naux) - Pi_w
+    blas.zdscal(-1.0, Pi_w.ravel(), overwrite_x=1)
+    np.fill_diagonal(Pi_w, np.diagonal(Pi_w) + 1.0)
+
+    ec_w += np.linalg.slogdet(Pi_w)[1]
+    #e_corr = 1.0 / (2.0 * np.pi) / nkpts * ec_w * wts_w
+    e_corr = ec_w * wts_w
+
+    return e_corr
+
+
+def get_rpa_exx(rpa, acfd=False, correction_only=False):
+    """Calculate RPA exchange energy.
+    For gapped systems, Hartree-Fock and adiabatic connection fluctuation dissipation exchange energies are the same.
+    For metallic systems, they are different.
+    The ACFD exchange energy is given by equation 12 in doi.org/10.1103/PhysRevB.81.115126
+
+    Parameters
+    ----------
+    rpa : KRPA
+        rpa object
+    acfd : bool, optional
+        calculate ACFD exchange energy, by default False
+    correction_only : bool, optional
+        only calculate the correction term, by default False
+
+    Returns
+    -------
+    ex : double
+        exchange energy
+    """
+    mo_energy = np.array(_mo_energy_frozen(rpa, rpa._scf.mo_energy))
+    mo_coeff = np.array(_mo_frozen(rpa, rpa._scf.mo_coeff))
+    mo_occ = np.array(_mo_occ_frozen(rpa, rpa._scf.mo_occ))
+
+    nocc = rpa.nocc
+    nao = rpa._scf.mo_coeff[0].shape[0]
+    nkpts = rpa.nkpts
+    kpts = rpa.kpts
+    mydf = rpa.with_df
+
+    # possible kpts shift center
+    kscaled = rpa.mol.get_scaled_kpts(kpts)
+    kscaled -= kscaled[0]
+
+    segsize = nkpts // size
+    if rank >= size - (nkpts - segsize * size):
+        start = rank * segsize + rank - (size - (nkpts - segsize * size))
+        stop = min(nkpts, start + segsize + 1)
+    else:
+        start = rank * segsize
+        stop = min(nkpts, start + segsize)
+
+    ex = 0j
+    cderiarr = mydf.cderi_array()
+    for kL in range(start, stop):
+        # kidx: save kj that conserves with kL and ki (-ki+kj+kL=G)
+        # kidx_r: save ki that conserves with kL and kj (-ki+kj+kL=G)
+        kidx = np.zeros(shape=[nkpts], dtype=np.int64)
+        kidx_r = np.zeros(shape=[nkpts], dtype=np.int64)
+        for i in range(nkpts):
+            for j in range(nkpts):
                 # Find (ki,kj) that satisfies momentum conservation with kL
                 kconserv = -kscaled[i] + kscaled[j] + kscaled[kL]
                 is_kconserv = np.linalg.norm(np.round(kconserv) - kconserv) < 1e-12
                 if is_kconserv:
                     kidx[i] = j
                     kidx_r[j] = i
-                    logger.debug(rpa, "Read Lpq (kL: %s / %s, ki: %s, kj: %s @ Rank %d)"%(kL+1, nkpts, i, j, rank))
-                    Lij_out = None
-                    # Read (L|pq) and ao2mo transform to (L|ij)
-                    Lpq = []
-                    for LpqR, LpqI, sign in mydf.sr_loop([kpti, kptj], max_memory=0.1*rpa._scf.max_memory, compact=False):
-                        Lpq.append(LpqR+LpqI*1.0j)
-                    # support uneqaul naux on different k points
-                    Lpq = np.vstack(Lpq).reshape(-1,nmo**2)
-                    tao = []
-                    ao_loc = None
-                    moij, ijslice = _conc_mos(mo_coeff[i], mo_coeff[j])[2:]
-                    Lij_out = _ao2mo.r_e2(Lpq, moij, ijslice, tao, ao_loc, out=Lij_out)
-                    Lij.append(Lij_out.reshape(-1,nmo,nmo))
-        Lij = np.asarray(Lij)
-        naux = Lij.shape[1]
 
-        if kL == 0:
-            for w in range(nw):
-                # body polarizability
-                if is_metal:
-                    Pi = get_rho_response_metal(rpa, freqs[w], mo_energy, mo_occ, Lij, kL, kidx)
+        for kn in range(nkpts):
+            # Find km that conserves with kn and kL (-km+kn+kL=G)
+            km = kidx_r[kn]
+
+            # logger.debug(gw, 'Read Lpq (kL: %s / %s, ki: %s, kj: %s @ Rank %d)' % (kL + 1, nkpts, i, j, rank))
+            # Read (L|pq) and ao2mo transform to (L|ij)
+            # support unequal naux on different k points
+            Lpq_ao = cderiarr.load(kpts[km], kpts[kn])
+            if Lpq_ao.shape[-1] == (nao * (nao + 1)) // 2:
+                Lpq_ao = lib.unpack_tril(Lpq_ao).reshape(-1, nao**2)
+            else:
+                Lpq_ao = Lpq_ao.reshape(-1, nao**2)
+            Lpq_ao = Lpq_ao.astype(np.complex128)
+
+            Lij = None
+            if hasattr(rpa._scf, 'sigma'):
+                idx_occ_i, idx_frac_i, _ = get_idx_metal(mo_occ[km])
+                idx_occ_j, idx_frac_j, _ = get_idx_metal(mo_occ[kn])
+                nocc_i = len(idx_occ_i) + len(idx_frac_i)
+                nocc_j = len(idx_occ_j) + len(idx_frac_j)
+                moij, ijslice = _conc_mos(mo_coeff[km][:, :nocc_i], mo_coeff[kn][:, :nocc_j])[2:]
+                Lij = r_e2(Lpq_ao, moij, ijslice, tao=[], ao_loc=None, out=Lij)
+                Lij = Lij.reshape(-1, nocc_i, nocc_j)
+
+                if acfd is True:
+                    if correction_only is True:
+                        mo_occ_ij = np.minimum(mo_occ[km][:nocc_i, None], mo_occ[kn][None, :nocc_j]) / 2.0
+                        mo_occ_ij -= mo_occ[km][:nocc_i, None] * mo_occ[kn][None, :nocc_j] / 4.0
+                    else:
+                        # numerical integration for equation 12 in doi.org/10.1103/PhysRevB.81.115126
+                        # NOTE: this integration is not stable!!!
+                        # w, wts = _get_scaled_legendre_roots(200)
+                        #eij = mo_energy[km][:nocc_i, None] - mo_energy[kn][None, :nocc_j]
+                        ##integrad = eij[:, :, None] / lib.direct_sum("ij+w->ijw", eij**2, w**2) * wts[None, None]
+                        #integrand = eij[:, :, None] / (eij[:, :, None]**2 + w**2) * wts[None, None]
+                        #integrand = np.sum(integrand, axis=2) * 2.0 / np.pi
+
+                        # The following line is equivalent to the frequency integration in equation 12 in
+                        # doi.org/10.1103/PhysRevB.81.115126
+                        # TODO: add a detailed note
+                        eij = mo_energy[km][:nocc_i, None] - mo_energy[kn][None, :nocc_j]
+                        integrand = np.zeros((nocc_i, nocc_j), dtype=np.complex128)
+                        integrand[eij > 1e-6] = 1
+                        integrand[eij < -1e-6] = -1
+                        mo_occ_ij = 1.0 - integrand
+                        # spin-restricted mo_occ should be divided by 2
+                        mo_occ_ij = mo_occ_ij * mo_occ[km][:nocc_i, None] / 2.0
                 else:
-                    Pi = get_rho_response(rpa, freqs[w], mo_energy, Lij, kL, kidx)
+                    mo_occ_ij = mo_occ[km][:nocc_i, None] * mo_occ[kn][None, :nocc_j] / 4.0
+                Lij_occ = Lij * mo_occ_ij[None]
+                # ex -= np.einsum('Lij,Lij->', Lij_occ.reshape(-1, nocc, nocc), Lij.reshape(-1, nocc, nocc).conj())
+                ex -= blas.zdotc(Lij_occ.ravel(), Lij.ravel())
+            else:
+                moij, ijslice = _conc_mos(mo_coeff[km][:, :nocc], mo_coeff[kn][:, :nocc])[2:]
+                Lij = r_e2(Lpq_ao, moij, ijslice, tao=[], ao_loc=None, out=Lij)
+                # ex -= np.einsum('Lij,Lij->', Lij.reshape(-1, nocc, nocc), Lij.reshape(-1, nocc, nocc).conj())
+                ex -= blas.zdotc(Lij.ravel(), Lij.ravel())
 
-                if rpa.fc:
-                    for iq in range(nq_pts):
-                        # head Pi_00
-                        Pi_00 = get_rho_response_head(rpa, freqs[w], mo_energy, qij[iq])
-                        Pi_00 = 4. * np.pi/np.linalg.norm(q_abs[iq])**2 * Pi_00
-                        # wings Pi_P0
-                        Pi_P0 = get_rho_response_wing(rpa, freqs[w], mo_energy, Lij, qij[iq])
-                        Pi_P0 = np.sqrt(4.*np.pi) / np.linalg.norm(q_abs[iq]) * Pi_P0
+    ex = ex.real
+    ex = comm.allreduce(ex, op=MPI.SUM)
+    ex /= nkpts**2
 
-                        # assemble Pi
-                        Pi_fc = np.zeros((naux+1,naux+1),dtype=Pi.dtype)
-                        Pi_fc[0,0] = Pi_00
-                        Pi_fc[0,1:] = Pi_P0.conj()
-                        Pi_fc[1:,0] = Pi_P0
-                        Pi_fc[1:,1:] = Pi
+    if rpa._scf.exxdiv == 'ewald' and rpa._scf.cell.dimension != 0:
+        madelung = tools.pbc.madelung(rpa._scf.cell, kpts)
+        exxdiv_shift = madelung * np.sum(mo_occ**2) / (4.0 * nkpts)
+        ex -= exxdiv_shift
+        if acfd is True:
+            for k in range(nkpts):
+                idx_occ, idx_frac, _ = get_idx_metal(mo_occ[k])
+                f_i = mo_occ[k][:(len(idx_occ) + len(idx_frac))] / 2.0
+                ex -= madelung * np.sum(f_i - f_i * f_i) / nkpts
 
-                        ec_w = np.log(np.linalg.det(np.eye(1+naux) - Pi_fc))
-                        ec_w += np.trace(Pi_fc)
-                        e_corr += 1./(2.*np.pi) * 1./nkpts * 1./nq_pts * ec_w * wts[w]
-                else:
-                    ec_w = np.log(np.linalg.det(np.eye(naux) - Pi))
-                    ec_w += np.trace(Pi)
-                    e_corr += 1./(2.*np.pi) * 1./nkpts * ec_w * wts[w]
-        else:
-            for w in range(nw):
-                if is_metal:
-                    Pi = get_rho_response_metal(rpa, freqs[w], mo_energy, mo_occ, Lij, kL, kidx)
-                else:
-                    Pi = get_rho_response(rpa, freqs[w], mo_energy, Lij, kL, kidx)
-                ec_w = np.log(np.linalg.det(np.eye(naux) - Pi))
-                ec_w += np.trace(Pi)
-                e_corr += 1./(2.*np.pi) * 1./nkpts * ec_w * wts[w]
-    comm.Barrier()
-    ecorr_gather = comm.gather(e_corr)
-    if rank == 0:
-        e_corr = np.sum(ecorr_gather)
-    comm.Barrier()
-    e_corr = comm.bcast(e_corr,root=0)
+    return ex
 
-    return e_corr.real
 
 class KRPA(lib.StreamObject):
+    def __init__(self, mf, frozen=None):
+        self.mol = mf.mol  # mol object
+        self._scf = mf  # mean-field object
+        self.verbose = self.mol.verbose  # verbose level
+        self.stdout = self.mol.stdout  # standard output
+        self.max_memory = mf.max_memory  # max memory in MB
 
-    # applying finite size corrections or not
-    fc = getattr(__config__, 'krpa_KRPA_fc', False)
+        # options
+        self.frozen = frozen  # frozen orbital options
+        self.grids_alg = 'legendre'  # algorithm to generate grids
+        self.outcore = False  # low-memory routine
+        self.segsize = 50  # number of orbitals in one segment for outcore
+        self.fc = False  # finite-size correction
+        self.fc_grid = False  # grids for finite-size correction
+        self.acfd_exx = False  # calculate ACFD exchange energy
 
-    def __init__(self, mf, frozen=0):
-        self.mol = mf.mol
-        self._scf = mf
-        self.verbose = self.mol.verbose
-        self.stdout = self.mol.stdout
-        self.max_memory = mf.max_memory
+        # don't modify the following attributes, they are not input options
+        self._nocc = None  # number of occupied orbitals
+        self._nmo = None  # number of orbitals (exclude frozen orbitals)
+        self.kpts = mf.kpts  # k-points
+        self.nkpts = len(self.kpts)  # number of k-points
+        self.mo_energy = np.array(mf.mo_energy, copy=True)  # orbital energy
+        self.mo_coeff = np.array(mf.mo_coeff, copy=True)  # orbital coefficient
+        self.mo_occ = np.array(mf.mo_occ, copy=True)  # occupation number
+        self.e_corr = None  # correlation energy
+        self.e_hf = None  # Hartree-Fock energy
+        self.e_tot = None  # total energy
 
-        #TODO: implement frozen orbs
-        if frozen > 0:
-            raise NotImplementedError
-        self.frozen = frozen
-
-        # DF-KGW must use GDF integrals
+        # KRPA must use GDF integrals
         if getattr(mf, 'with_df', None):
             self.with_df = mf.with_df
         else:
             raise NotImplementedError
         self._keys.update(['with_df'])
 
-##################################################
-# don't modify the following attributes, they are not input options
-        self._nocc = None
-        self._nmo = None
-        self.kpts = mf.kpts
-        self.nkpts = len(self.kpts)
-        self.mo_energy = mf.mo_energy
-        self.mo_coeff = mf.mo_coeff
-        self.mo_occ = mf.mo_occ
-        self.e_corr = None
-        self.e_hf = None
-        self.e_tot = None
-        self.fc_grid = False
+        return
 
-        keys = set(('fc'))
-        self._keys = set(self.__dict__.keys()).union(keys)
-
-    def dump_flags(self):
+    def dump_flags(self, verbose=None):
         log = logger.Logger(self.stdout, self.verbose)
         log.info('')
         log.info('******** %s ********', self.__class__)
@@ -293,22 +801,37 @@ class KRPA(lib.StreamObject):
         nocc = self.nocc
         nvir = self.nmo - nocc
         nkpts = self.nkpts
-        log.info('RPA nocc = %d, nvir = %d, nkpts = %d', nocc, nvir, nkpts)
-        if self.frozen > 0:
-            log.info('frozen orbitals = %s', str(self.frozen))
-        logger.info(self, 'RPA finite size corrections = %s', self.fc)
-        return self
+        log.info(f'RPA nocc = {nocc}, nvir = {nvir}, nkpts = {nkpts}')
+        if self.frozen is not None:
+            log.info(f'frozen orbitals = {str(self.frozen)}')
+        log.info('grid type = %s', self.grids_alg)
+        log.info('outcore mode = %s', self.outcore)
+        if self.outcore is True:
+            log.info('outcore segment size = %d', self.segsize)
+        log.info('RPA finite size corrections = %s', self.fc)
+        log.info('ACFD exchange energy = %s', self.acfd_exx)
+        log.info('')
+        return
 
     @property
     def nocc(self):
-        return self.mol.nelectron // 2
+        frozen_mask = get_frozen_mask(self)
+        nkpts = len(self._scf.mo_energy)
+        nelec = 0.0
+        for k in range(nkpts):
+            nelec += np.sum(self._scf.mo_occ[k][frozen_mask[k]])
+        nelec = int(nelec / nkpts)
+        return nelec // 2
+
     @nocc.setter
     def nocc(self, n):
         self._nocc = n
 
     @property
     def nmo(self):
-        return len(self._scf.mo_energy[0])
+        frozen_mask = get_frozen_mask(self)
+        return len(self._scf.mo_energy[0][frozen_mask[0]])
+
     @nmo.setter
     def nmo(self, n):
         self._nmo = n
@@ -317,147 +840,291 @@ class KRPA(lib.StreamObject):
     get_nmo = get_nmo
     get_frozen_mask = get_frozen_mask
 
-    def kernel(self, mo_energy=None, mo_coeff=None, nw=40):
-        """
-        Args:
-            mo_energy : 2D array (nkpts, nmo), mean-field mo energy
-            mo_coeff : 3D array (nkpts, nmo, nmo), mean-field mo coefficient
-            nw: integer, grid number
+    def kernel(self, mo_energy=None, mo_coeff=None, nw=None, with_e_hf=None):
+        """RPA correlation and total energy
 
-        Returns:
-            self.e_tot : RPA total eenrgy
-            self.e_hf : EXX energy
-            self.e_corr : RPA correlation energy
+        Calculated total energy, HF energy and RPA correlation energy
+        are stored in self.e_tot, self.e_hf, self.e_corr
+
+        Parameters
+        ----------
+        mo_energy : double array
+            molecular orbital energies
+        mo_coeff : double ndarray
+            molecular orbital coefficients
+        nw : int, optional
+            number of frequency point on imaginary axis, by default None
+        with_e_hf : float, optional
+            If given, overrides the HF energy computation.
+
+        Returns
+        -------
+        e_tot : float
+            RPA total energy
+        e_hf : float
+            HF energy (exact exchange for given mo_coeff)
+        e_corr : float
+            RPA correlation energy
         """
         if mo_coeff is None:
-            mo_coeff = np.array(self._scf.mo_coeff)
+            mo_coeff = _mo_frozen(self, self._scf.mo_coeff)
         if mo_energy is None:
-            mo_energy = np.array(self._scf.mo_energy)
-
-        nmo = self.nmo
-        naux = self.with_df.get_naoaux()
-        nkpts = self.nkpts
-        mem_incore = (2 * nkpts * nmo**2 * naux) * 16/1e6
-        mem_now = lib.current_memory()[0]
-        if (mem_incore + mem_now > 0.99*self.max_memory):
-            if rank == 0:
-                logger.warn(self, 'Memory may not be enough!')
-            raise NotImplementedError
+            mo_energy = _mo_energy_frozen(self, self._scf.mo_energy)
 
         cput0 = (time.process_time(), time.perf_counter())
         if rank == 0:
             self.dump_flags()
-        self.e_tot, self.e_hf, self.e_corr = \
-                kernel(self, mo_energy, mo_coeff, nw=nw, verbose=self.verbose)
+        self.e_tot, self.e_hf, self.e_corr = kernel(self, mo_energy, mo_coeff, nw=nw, with_e_hf=with_e_hf)
 
         if rank == 0:
             logger.timer(self, 'RPA', *cput0)
         return self.e_tot, self.e_hf, self.e_corr
 
+    def get_grids(self, alg=None, nw=None, mo_energy=None):
+        """Generate grids for integration.
+
+        Parameters
+        ----------
+        alg : str, optional
+            algorithm for generating grids, by default None
+        nw : int, optional
+            number of grids, by default None
+        mo_energy : double 2d array, optional
+            orbital energy, used for minimax grids, by default None
+
+        Returns
+        -------
+        freqs : double 1d array
+            frequency grid
+        wts : double 1d array
+            weight of grids
+        """
+        if alg is None:
+            alg = self.grids_alg
+        if mo_energy is None:
+            mo_energy = _mo_energy_frozen(self, self._scf.mo_energy)
+        if alg == 'legendre':
+            nw = 40 if nw is None else nw
+            freqs, wts = _get_scaled_legendre_roots(nw)
+        elif alg == 'minimax':
+            nw = 30 if nw is None else nw
+            E_max = 0
+            E_min = 1e10
+            for k in range(self.nkpts):
+                E_max = max(E_max, mo_energy[k, -1] - mo_energy[k, 0])
+                E_min = min(E_min, mo_energy[k, self.nocc] - mo_energy[k, self.nocc - 1])
+            E_range = E_max / E_min
+            freqs, wts = get_frequency_minimax_grid(nw, E_range)
+        else:
+            raise NotImplementedError('Grids algorithm not implemented!')
+
+        return freqs, wts
+
+    def get_q_mesh(self, mo_energy, mo_coeff):
+        """Get q-mesh for finite size correction.
+        Equation 39-42 in doi.org/10.1021/acs.jctc.0c00704
+
+        Parameters
+        ----------
+        mo_energy : double 2d array
+            orbital energy
+        mo_coeff : double 3d array
+            coefficient from AO to MO
+
+        Returns
+        -------
+        qij : double 1d array
+            q-mesh grids
+        q_abs : double 1d array
+            absolute positions of q-mesh grids
+        nq_pts : init
+            number of q-mesh grids
+        """
+        nocc = self.nocc
+        nmo = self.nmo
+        nkpts = self.nkpts
+        # Set up q mesh for q->0 finite size correction
+        if not self.fc_grid:
+            q_pts = np.array([1e-3, 0, 0], dtype=np.double).reshape(1, 3)
+        else:
+            Nq = 3
+            q_pts = np.zeros(shape=[Nq**3 - 1, 3], dtype=np.double)
+            for i in range(Nq):
+                for j in range(Nq):
+                    for k in range(Nq):
+                        if i == 0 and j == 0 and k == 0:
+                            continue
+                        else:
+                            q_pts[i * Nq**2 + j * Nq + k - 1, 0] = k * 5e-4
+                            q_pts[i * Nq**2 + j * Nq + k - 1, 1] = j * 5e-4
+                            q_pts[i * Nq**2 + j * Nq + k - 1, 2] = i * 5e-4
+        nq_pts = len(q_pts)
+        q_abs = self.mol.get_abs_kpts(q_pts)
+
+        # Get qij = 1/sqrt(Omega) * < psi_{ik} | e^{iqr} | psi_{ak-q} > at q: (nkpts, nocc, nvir)
+        qij = np.zeros(shape=[nq_pts, nkpts, nocc, nmo - nocc], dtype=np.complex128)
+
+        if not self.fc_grid:
+            for k in range(nq_pts):
+                qij[k] = get_qij(self, q_abs[k], mo_energy, mo_coeff)
+        else:
+            segsize = nq_pts // size
+            if rank >= size - (nq_pts - segsize * size):
+                start = rank * segsize + rank - (size - (nq_pts - segsize * size))
+                stop = min(nq_pts, start + segsize + 1)
+            else:
+                start = rank * segsize
+                stop = min(nq_pts, start + segsize)
+            for k in range(start, stop):
+                qij[k] = get_qij(self, q_abs[k], mo_energy, mo_coeff)
+            comm.Barrier()
+            qij_gather = comm.gather(qij)
+            if rank == 0:
+                for i in range(1, size):
+                    qij += qij_gather[i]
+            comm.Barrier()
+            qij = comm.bcast(qij, root=0)
+
+        return qij, q_abs, nq_pts
+
+    def get_acfd_exx(self, correction_only=False):
+        """Calculate ACFD exchange energy.
+
+        Parameters
+        ----------
+        correction_only : bool
+            only return the correction term
+
+        Returns
+        -------
+        ex_acfd : double
+            ACFD exchange energy
+        """
+        ex_acfd = get_rpa_exx(self, acfd=True, correction_only=correction_only)
+        return ex_acfd
+
+
 if __name__ == '__main__':
+    import os
     from pyscf.pbc import gto, dft, scf
     from pyscf.pbc.lib import chkfile
-    import os
+
     # This test takes a few minutes
     # Test on diamond
-    cell = gto.Cell()
-    cell.build(unit = 'angstrom',
-            a = '''
+    cell_test = gto.Cell()
+    cell_test.build(
+        unit='angstrom',
+        a="""
                 0.000000     1.783500     1.783500
                 1.783500     0.000000     1.783500
                 1.783500     1.783500     0.000000
-            ''',
-            atom = 'C 1.337625 1.337625 1.337625; C 2.229375 2.229375 2.229375',
-            dimension = 3,
-            max_memory = 12000,
-            verbose = 5,
-            pseudo = 'gth-pbe',
-            basis='gth-dzv',
-            precision=1e-12)
+            """,
+        atom='C 1.337625 1.337625 1.337625; C 2.229375 2.229375 2.229375',
+        dimension=3,
+        max_memory=12000,
+        verbose=5,
+        pseudo='gth-pbe',
+        basis='gth-dzv',
+        precision=1e-12,
+    )
 
-    kpts = cell.make_kpts([3,1,1],scaled_center=[0,0,0])
-    gdf = df.GDF(cell, kpts)
-    gdf_fname = 'gdf_ints_311.h5'
-    gdf._cderi_to_save = gdf_fname
-    if not os.path.isfile(gdf_fname):
-        gdf.build()
+    kpts_test = cell_test.make_kpts([3, 1, 1], scaled_center=[0, 0, 0])
+    gdf_test = df.RSGDF(cell_test, kpts_test)
+    gdf_fname_test = 'gdf_ints_311.h5'
+    gdf_test._cderi_to_save = gdf_fname_test
+    if not os.path.isfile(gdf_fname_test):
+        gdf_test.build()
 
-    chkfname = 'diamond_311.chk'
-    if os.path.isfile(chkfname):
-        kmf = scf.KRHF(cell, kpts)
-        kmf.with_df = gdf
-        kmf.with_df._cderi = gdf_fname
-        data = chkfile.load(chkfname, 'scf')
-        kmf.__dict__.update(data)
+    chkfname_test = 'diamond_311.chk'
+    if os.path.isfile(chkfname_test):
+        kmf_test = scf.KRHF(cell_test, kpts_test).rs_density_fit()
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        data_test = chkfile.load(chkfname_test, 'scf')
+        kmf_test.__dict__.update(data_test)
     else:
-        kmf = scf.KRHF(cell, kpts)
-        kmf.with_df = gdf
-        kmf.with_df._cderi = gdf_fname
-        kmf.conv_tol = 1e-12
-        kmf.chkfile = chkfname
-        kmf.kernel()
+        kmf_test = scf.KRHF(cell_test, kpts_test).rs_density_fit()
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        kmf_test.conv_tol = 1e-12
+        kmf_test.chkfile = chkfname_test
+        kmf_test.kernel()
 
-    rpa = KRPA(kmf)
-    rpa.fc = False
-    rpa.kernel()
-    if rank == 0:
-        print(rpa.e_tot, rpa.e_corr)
-    assert(abs(rpa.e_corr- -0.1852772037535004) < 1e-6)
-    assert(abs(rpa.e_tot- -10.694392044197565) < 1e-6)
+    rpa_test = KRPA(kmf_test)
+    rpa_test.fc = True
+    rpa_test.kernel()
+    assert abs(rpa_test.e_corr - -0.20723389722097715) < 1e-6
+    assert abs(rpa_test.e_tot - -10.716348738655793) < 1e-6
 
-    # with finite size corrections
-    rpa.fc = True
-    rpa.kernel()
-    if rank == 0:
-        print(rpa.e_tot, rpa.e_corr)
-    assert(abs(rpa.e_corr- -0.20723563246774715) < 1e-6)
-    assert(abs(rpa.e_tot- -10.716350472911811) < 1e-6)
+    rpa_test = KRPA(kmf_test)
+    rpa_test.fc = False
+    rpa_test.kernel()
+    assert abs(rpa_test.e_corr - -0.1852772037535004) < 1e-6
+    assert abs(rpa_test.e_tot - -10.694392044197565) < 1e-6
+
+    rpa_test = KRPA(kmf_test)
+    rpa_test.outcore = True
+    rpa_test.segsize = 2
+    rpa_test.kernel()
+    assert abs(rpa_test.e_corr - -0.1852772037535004) < 1e-6
+    assert abs(rpa_test.e_tot - -10.694392044197565) < 1e-6
 
     # Test on Na (metallic)
-    cell = gto.Cell()
-    cell.build(unit = 'angstrom',
-           a = '''
+    cell_test = gto.Cell()
+    cell_test.build(
+        unit='angstrom',
+        a="""
            -2.11250000000000   2.11250000000000   2.11250000000000
            2.11250000000000  -2.11250000000000   2.11250000000000
            2.11250000000000   2.11250000000000  -2.11250000000000
-           ''',
-           atom = '''
+           """,
+        atom="""
            Na   0.00000   0.00000   0.00000
-           ''',
-           dimension = 3,
-           max_memory = 126000,
-           verbose = 5,
-           pseudo = 'gth-pade',
-           basis='gth-dzvp-molopt-sr',
-           precision=1e-10)
+           """,
+        dimension=3,
+        max_memory=126000,
+        verbose=5,
+        pseudo='gth-pade',
+        basis='gth-dzvp-molopt-sr',
+        precision=1e-10,
+    )
 
-    kpts = cell.make_kpts([2,2,1],scaled_center=[0,0,0])
-    gdf = df.GDF(cell, kpts)
-    gdf_fname = 'gdf_ints_221.h5'
-    gdf._cderi_to_save = gdf_fname
-    if not os.path.isfile(gdf_fname):
-        gdf.build()
+    kpts_test = cell_test.make_kpts([2, 2, 1], scaled_center=[0, 0, 0])
+    gdf_test = df.RSGDF(cell_test, kpts_test)
+    gdf_fname_test = 'gdf_ints_221.h5'
+    gdf_test._cderi_to_save = gdf_fname_test
+    if not os.path.isfile(gdf_fname_test):
+        gdf_test.build()
 
-    chkfname = 'na_221.chk'
-    if os.path.isfile(chkfname):
-        kmf = dft.KRKS(cell, kpts)
-        kmf = scf.addons.smearing_(kmf, sigma=5e-3, method="fermi")
-        kmf.xc = 'lda'
-        kmf.with_df = gdf
-        kmf.with_df._cderi = gdf_fname
-        data = chkfile.load(chkfname, 'scf')
-        kmf.__dict__.update(data)
+    chkfname_test = 'na_221.chk'
+    if os.path.isfile(chkfname_test):
+        kmf_test = dft.KRKS(cell_test, kpts_test).rs_density_fit()
+        kmf_test = scf.addons.smearing_(kmf_test, sigma=5e-3, method='fermi')
+        kmf_test.xc = 'lda'
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        data_test = chkfile.load(chkfname_test, 'scf')
+        kmf_test.__dict__.update(data_test)
     else:
-        kmf = dft.KRKS(cell, kpts)
-        kmf = scf.addons.smearing_(kmf, sigma=5e-3, method="fermi")
-        kmf.xc = 'lda'
-        kmf.with_df = gdf
-        kmf.with_df._cderi = gdf_fname
-        kmf.conv_tol = 1e-12
-        kmf.chkfile = chkfname
-        kmf.kernel()
+        kmf_test = dft.KRKS(cell_test, kpts_test).rs_density_fit()
+        kmf_test = scf.addons.smearing_(kmf_test, sigma=5e-3, method='fermi')
+        kmf_test.xc = 'lda'
+        kmf_test.with_df = gdf_test
+        kmf_test.with_df._cderi = gdf_fname_test
+        kmf_test.conv_tol = 1e-12
+        kmf_test.chkfile = chkfname_test
+        kmf_test.kernel()
 
-    rpa = KRPA(kmf)
-    rpa.kernel()
-    assert(abs(rpa.e_corr- -0.04031792880477294) < 1e-6)
-    assert(abs(rpa.e_tot- -47.60693294927457) < 1e-6)
+    rpa_test = KRPA(kmf_test)
+    rpa_test.kernel()
+    assert abs(rpa_test.e_corr - -0.04031792880477294) < 1e-5
+    assert abs(rpa_test.e_tot - -47.60693294927457) < 1e-5
+
+    rpa_test = KRPA(kmf_test)
+    rpa_test.outcore = True
+    rpa_test.segsize = 3
+    rpa_test.kernel()
+    assert abs(rpa_test.e_corr - -0.04031792880477294) < 1e-5
+    assert abs(rpa_test.e_tot - -47.60693294927457) < 1e-5
+
+    print('passed tests!')
